@@ -1,27 +1,32 @@
 import requests
 
-url = "https://data-api.polymarket.com/trades"
+url = "https://data-api.polymarket.com/v1/leaderboard"
 
-response = requests.get(url)
+params = {
+    "category": "OVERALL",
+    "timePeriod": "ALL",
+    "orderBy": "PNL",
+    "limit": 20
+}
+
+response = requests.get(url, params=params)
 
 print("Status:", response.status_code)
 
 if response.status_code == 200:
-    trades = response.json()
+    traders = response.json()
 
-    print(f"Fant {len(trades)} trades.\n")
+    print(f"\nFant {len(traders)} topptradere:\n")
 
-    for trade in trades[:20]:
+    for trader in traders:
         print(
-            "Trader:",
-            trade.get("proxyWallet"),
-            "| Side:",
-            trade.get("side"),
-            "| Pris:",
-            trade.get("price"),
-            "| Størrelse:",
-            trade.get("size")
+            f"#{trader.get('rank')} "
+            f"{trader.get('userName') or 'Ukjent'} | "
+            f"PNL: ${trader.get('pnl'):,.2f} | "
+            f"Volum: ${trader.get('vol'):,.2f} | "
+            f"Wallet: {trader.get('proxyWallet')}"
         )
+
 else:
     print("Noe gikk galt:")
     print(response.text)
