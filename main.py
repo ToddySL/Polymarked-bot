@@ -24,7 +24,6 @@ conn = sqlite3.connect(DB)
 cursor = conn.cursor()
 
 
-# Vanlige trades
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS trades (
     trade_id TEXT PRIMARY KEY,
@@ -41,7 +40,6 @@ CREATE TABLE IF NOT EXISTS trades (
 """)
 
 
-# Paper-konto
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS paper_account (
     id INTEGER PRIMARY KEY,
@@ -50,14 +48,12 @@ CREATE TABLE IF NOT EXISTS paper_account (
 """)
 
 
-# Opprett konto med 400 kr første gang
 cursor.execute("""
 INSERT OR IGNORE INTO paper_account (id, balance)
 VALUES (1, ?)
 """, (PAPER_START_BALANCE,))
 
 
-# Paper-posisjoner
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS paper_positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,12 +73,11 @@ conn.commit()
 
 
 # --------------------------------------------------
-# PAPER TRADING
+# PAPER BUY
 # --------------------------------------------------
 
 def paper_buy(trader, outcome, price, title, timestamp):
 
-    # Sikkerhet mot ugyldig pris
     if not price or price <= 0:
         print("⚠️ Ugyldig pris. Paper-kjøp hoppes over.")
         return False
@@ -108,10 +103,8 @@ def paper_buy(trader, outcome, price, title, timestamp):
 
         return False
 
-    # Hvor mange shares vi får for 40 kr
     shares = PAPER_TRADE_SIZE / price
 
-    # Trekk 40 kr fra saldo
     new_balance = balance - PAPER_TRADE_SIZE
 
     cursor.execute(
@@ -123,7 +116,6 @@ def paper_buy(trader, outcome, price, title, timestamp):
         (new_balance,)
     )
 
-    # Lagre posisjonen
     cursor.execute(
         """
         INSERT INTO paper_positions (
@@ -163,6 +155,217 @@ def paper_buy(trader, outcome, price, title, timestamp):
     print("Ny saldo:", f"{new_balance:.2f} kr")
 
     return True
+
+
+# --------------------------------------------------
+# HENT AKTUELL MARKEDSPRIS
+# --------------------------------------------------
+
+def get_current_price(title, outcome):
+
+    try:
+
+        response = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={
+                "search": title,
+                "limit": 10
+            },
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return None
+
+        markets = response.json()
+
+        for market in markets:
+
+            market_title = market.get("question")
+
+            if market_title != title:
+                continue
+
+            tokens = market.get("tokens", [])
+
+            for token in tokens:
+
+                if token.get("outcome") == outcome:
+
+                    price = token.get("price")
+
+                    if price is not None:
+                        return float(price)
+
+    except Exception as e:
+
+        print(
+            "⚠️ Kunne ikke hente markedspris:",
+            e
+        )
+
+    return None
+
+
+# --------------------------------------------------
+# PAPER-KONTO STATUS
+# --------------------------------------------------
+
+def show_paper_account():
+
+    cursor.execute(
+        "SELECT balance FROM paper_account WHERE id = 1"
+    )
+
+    paper_balance = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT
+            id,
+            trader,
+            outcome,
+            price,
+            shares,
+            invested,
+            title
+        FROM paper_positions
+        WHERE status = 'OPEN'
+    """)
+
+    positions = cursor.fetchall()
+
+    total_invested = 0
+    total_value = 0
+
+    print()
+    print("💰 PAPER-KONTO")
+    print("=" * 60)
+
+    print(
+        "Saldo:",
+        f"{paper_balance:.2f} kr"
+    )
+
+    print(
+        "Åpne posisjoner:",
+        len(positions)
+    )
+
+    print("-" * 60)
+
+    for position in positions:
+
+        (
+            position_id,
+            trader,
+            outcome,
+            entry_price,
+            shares,
+            invested,
+            title
+        ) = position
+
+        current_price = get_current_price(
+            title,
+            outcome
+        )
+
+        total_invested += invested
+
+        if current_price is not None:
+
+            current_value = shares * current_price
+
+            profit = current_value - invested
+
+            profit_percent = (
+                profit / invested
+            ) * 100
+
+            total_value += current_value
+
+            print()
+            print("📊 POSISJON")
+            print("Marked:", title)
+            print("Outcome:", outcome)
+            print("Trader:", trader)
+            print("Kjøpspris:", f"{entry_price:.4f}")
+            print(
+                "Nåværende pris:",
+                f"{current_price:.4f}"
+            )
+            print(
+                "Investert:",
+                f"{invested:.2f} kr"
+            )
+            print(
+                "Verdi:",
+                f"{current_value:.2f} kr"
+            )
+
+            if profit >= 0:
+                print(
+                    "Resultat:",
+                    f"+{profit:.2f} kr "
+                    f"(+{profit_percent:.2f}%)"
+                )
+            else:
+                print(
+                    "Resultat:",
+                    f"{profit:.2f} kr "
+                    f"({profit_percent:.2f}%)"
+                )
+
+        else:
+
+            print()
+            print("📊 POSISJON")
+            print("Marked:", title)
+            print("Outcome:", outcome)
+            print(
+                "⚠️ Nåværende pris ikke tilgjengelig."
+            )
+
+    print()
+    print("-" * 60)
+
+    print(
+        "Totalt investert:",
+        f"{total_invested:.2f} kr"
+    )
+
+    if total_value > 0:
+
+        total_profit = (
+            total_value - total_invested
+        )
+
+        total_profit_percent = (
+            total_profit / total_invested
+        ) * 100
+
+        print(
+            "Markedsverdi:",
+            f"{total_value:.2f} kr"
+        )
+
+        if total_profit >= 0:
+
+            print(
+                "Totalt resultat:",
+                f"+{total_profit:.2f} kr "
+                f"(+{total_profit_percent:.2f}%)"
+            )
+
+        else:
+
+            print(
+                "Totalt resultat:",
+                f"{total_profit:.2f} kr "
+                f"({total_profit_percent:.2f}%)"
+            )
+
+    print("=" * 60)
 
 
 # --------------------------------------------------
@@ -259,7 +462,7 @@ def get_trades(wallet):
 
 
 # --------------------------------------------------
-# SJEKK OM TRADE ALLEREDE ER SETT
+# TRADE ALLEREDE SETT?
 # --------------------------------------------------
 
 def trade_exists(trade_id):
@@ -273,7 +476,7 @@ def trade_exists(trade_id):
 
 
 # --------------------------------------------------
-# LAG TRADE-ID
+# TRADE-ID
 # --------------------------------------------------
 
 def create_trade_id(wallet, trade):
@@ -421,7 +624,6 @@ for trade in new_trades:
 
     value = price * size
 
-    # Minimum størrelse
     if value < 1000:
         continue
 
@@ -488,7 +690,6 @@ else:
         print("Tid:", time)
 
 
-        # Paper-kjøp
         paper_buy(
             trader=signal["trader"],
             outcome=signal["outcome"],
@@ -517,54 +718,10 @@ print("=" * 60)
 
 
 # --------------------------------------------------
-# PAPER-KONTO
+# PAPER STATUS
 # --------------------------------------------------
 
-cursor.execute(
-    "SELECT balance FROM paper_account WHERE id = 1"
-)
-
-paper_balance = cursor.fetchone()[0]
-
-
-cursor.execute("""
-    SELECT SUM(invested)
-    FROM paper_positions
-    WHERE status = 'OPEN'
-""")
-
-paper_invested = cursor.fetchone()[0] or 0
-
-
-cursor.execute("""
-    SELECT COUNT(*)
-    FROM paper_positions
-    WHERE status = 'OPEN'
-""")
-
-paper_positions = cursor.fetchone()[0]
-
-
-print()
-print("💰 PAPER-KONTO")
-print("-" * 50)
-
-print(
-    "Saldo:",
-    f"{paper_balance:.2f} kr"
-)
-
-print(
-    "Investert:",
-    f"{paper_invested:.2f} kr"
-)
-
-print(
-    "Åpne posisjoner:",
-    paper_positions
-)
-
-print("=" * 60)
+show_paper_account()
 
 
 # --------------------------------------------------
