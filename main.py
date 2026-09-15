@@ -3,30 +3,26 @@ import sqlite3
 import json
 from datetime import datetime
 
-
-# --------------------------------------------------
-# INNSTILLINGER
-# --------------------------------------------------
-
 DB = "trades.db"
 
 LEADERBOARD_URL = "https://data-api.polymarket.com/v1/leaderboard"
 TRADES_URL = "https://data-api.polymarket.com/trades"
-
 GAMMA_MARKET_URL = "https://gamma-api.polymarket.com/markets"
+CLOB_MIDPOINT_URL = "https://clob.polymarket.com/midpoint"
 CLOB_PRICE_URL = "https://clob.polymarket.com/price"
 
 PAPER_START_BALANCE = 400.0
 PAPER_TRADE_SIZE = 40.0
 
-
-# --------------------------------------------------
+# ---------------------------------------------------------
 # DATABASE
-# --------------------------------------------------
+# ---------------------------------------------------------
 
-conn = sqlite3.connect(DB)
+conn = sqlite3.connect(DB, timeout=30)
 cursor = conn.cursor()
 
+cursor.execute("PRAGMA busy_timeout = 30000")
+cursor.execute("PRAGMA journal_mode = WAL")
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS trades (
@@ -44,15 +40,10 @@ CREATE TABLE IF NOT EXISTS trades (
 )
 """)
 
-
-# Gammel database kan mangle condition_id
 try:
-    cursor.execute(
-        "ALTER TABLE trades ADD COLUMN condition_id TEXT"
-    )
+    cursor.execute("ALTER TABLE trades ADD COLUMN condition_id TEXT")
 except sqlite3.OperationalError:
     pass
-
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS paper_account (
@@ -61,12 +52,10 @@ CREATE TABLE IF NOT EXISTS paper_account (
 )
 """)
 
-
 cursor.execute("""
 INSERT OR IGNORE INTO paper_account (id, balance)
 VALUES (1, ?)
 """, (PAPER_START_BALANCE,))
-
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS paper_positions (
@@ -83,37 +72,22 @@ CREATE TABLE IF NOT EXISTS paper_positions (
 )
 """)
 
-
-# Gammel database kan mangle condition_id
 try:
-    cursor.execute(
-        "ALTER TABLE paper_positions ADD COLUMN condition_id TEXT"
-    )
+    cursor.execute("ALTER TABLE paper_positions ADD COLUMN condition_id TEXT")
 except sqlite3.OperationalError:
     pass
-
 
 conn.commit()
 
 
-# --------------------------------------------------
+# ---------------------------------------------------------
 # PAPER BUY
-# --------------------------------------------------
+# ---------------------------------------------------------
 
-def paper_buy(
-    trader,
-    outcome,
-    price,
-    title,
-    timestamp,
-    condition_id
-):
+def paper_buy(trader, outcome, price, title, timestamp, condition_id):
 
     if not price or price <= 0:
-        print(
-            "⚠️ Ugyldig pris. "
-            "Paper-kjøp hoppes over."
-        )
+        print("⚠️ Ugyldig pris. Paper-kjøp hoppes over.")
         return False
 
     cursor.execute(
@@ -129,29 +103,22 @@ def paper_buy(
     balance = row[0]
 
     if balance < PAPER_TRADE_SIZE:
-
         print(
             f"⚠️ Ikke nok paper-penger. "
             f"Saldo: {balance:.2f} kr"
         )
-
         return False
 
     shares = PAPER_TRADE_SIZE / price
-
     new_balance = balance - PAPER_TRADE_SIZE
 
-    cursor.execute(
-        """
+    cursor.execute("""
         UPDATE paper_account
         SET balance = ?
         WHERE id = 1
-        """,
-        (new_balance,)
-    )
+    """, (new_balance,))
 
-    cursor.execute(
-        """
+    cursor.execute("""
         INSERT INTO paper_positions (
             trader,
             outcome,
@@ -164,74 +131,45 @@ def paper_buy(
             condition_id
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            trader,
-            outcome,
-            price,
-            shares,
-            PAPER_TRADE_SIZE,
-            title,
-            timestamp,
-            "OPEN",
-            condition_id
-        )
-    )
+    """, (
+        trader,
+        outcome,
+        price,
+        shares,
+        PAPER_TRADE_SIZE,
+        title,
+        timestamp,
+        "OPEN",
+        condition_id
+    ))
 
     conn.commit()
 
     print()
     print("💰 PAPER-KJØP")
     print("-" * 50)
-
     print("Trader:", trader)
     print("Outcome:", outcome)
     print("Pris:", price)
-
-    print(
-        "Investert:",
-        f"{PAPER_TRADE_SIZE:.2f} kr"
-    )
-
-    print(
-        "Shares:",
-        f"{shares:.2f}"
-    )
-
-    print(
-        "Ny saldo:",
-        f"{new_balance:.2f} kr"
-    )
+    print("Investert:", f"{PAPER_TRADE_SIZE:.2f} kr")
+    print("Shares:", f"{shares:.2f}")
+    print("Ny saldo:", f"{new_balance:.2f} kr")
 
     return True
 
 
-# --------------------------------------------------
-# REPARER GAMMEL POSITION FRA TRADES-DATABASEN
-# --------------------------------------------------
+# ---------------------------------------------------------
+# REPAIR OLD POSITIONS
+# ---------------------------------------------------------
 
-def repair_position_from_trades(
-    position_id,
-    title,
-    outcome
-):
+def repair_position_from_trades(position_id, title, outcome):
 
     print()
-    print(
-        "🔧 Mangler condition_id."
-    )
+    print("🔧 Mangler condition_id.")
+    print("🔎 Søker i registrerte trades...")
 
-    print(
-        "🔎 Søker i registrerte trades..."
-    )
-
-    # --------------------------------------------------
-    # FØRSTE FORSØK:
-    # Samme marked + samme outcome
-    # --------------------------------------------------
-
-    cursor.execute(
-        """
+    # Først: samme marked + samme outcome
+    cursor.execute("""
         SELECT condition_id, title, outcome
         FROM trades
         WHERE condition_id IS NOT NULL
@@ -240,56 +178,30 @@ def repair_position_from_trades(
           AND LOWER(outcome) = LOWER(?)
         ORDER BY timestamp DESC
         LIMIT 1
-        """,
-        (
-            title,
-            outcome
-        )
-    )
+    """, (title, outcome))
 
     match = cursor.fetchone()
-
 
     if match:
 
         condition_id = match[0]
 
-        print(
-            "✅ Fant match i trades-databasen!"
-        )
+        print("✅ Fant match i trades-databasen!")
+        print("Condition ID:", condition_id)
 
-        print(
-            "Condition ID:",
-            condition_id
-        )
-
-        cursor.execute(
-            """
+        cursor.execute("""
             UPDATE paper_positions
             SET condition_id = ?
             WHERE id = ?
-            """,
-            (
-                condition_id,
-                position_id
-            )
-        )
+        """, (condition_id, position_id))
 
         conn.commit()
 
         return condition_id
 
-
-    # --------------------------------------------------
-    # ANDRE FORSØK:
-    # Samme marked, uansett outcome
-    #
-    # Dette er nyttig dersom en annen trader
-    # allerede har handlet motsatt side.
-    # --------------------------------------------------
-
-    cursor.execute(
-        """
+    # Hvis outcome ikke matcher:
+    # søk bare på markedet
+    cursor.execute("""
         SELECT condition_id, title, outcome
         FROM trades
         WHERE condition_id IS NOT NULL
@@ -297,63 +209,36 @@ def repair_position_from_trades(
           AND title = ?
         ORDER BY timestamp DESC
         LIMIT 1
-        """,
-        (title,)
-    )
+    """, (title,))
 
     match = cursor.fetchone()
-
 
     if match:
 
         condition_id = match[0]
 
-        print(
-            "✅ Fant markedet i trades-databasen!"
-        )
+        print("✅ Fant markedet i trades-databasen!")
+        print("Matchende outcome:", match[2])
+        print("Condition ID:", condition_id)
 
-        print(
-            "Matchende outcome:",
-            match[2]
-        )
-
-        print(
-            "Condition ID:",
-            condition_id
-        )
-
-        cursor.execute(
-            """
+        cursor.execute("""
             UPDATE paper_positions
             SET condition_id = ?
             WHERE id = ?
-            """,
-            (
-                condition_id,
-                position_id
-            )
-        )
+        """, (condition_id, position_id))
 
         conn.commit()
 
         return condition_id
 
-
-    # --------------------------------------------------
-    # INGENTING FUNNET
-    # --------------------------------------------------
-
-    print(
-        "⚠️ Fant ingen registrert trade "
-        "med dette markedet."
-    )
+    print("⚠️ Fant ingen registrert trade med dette markedet.")
 
     return None
 
 
-# --------------------------------------------------
-# HENT MARKED FRA CONDITION ID
-# --------------------------------------------------
+# ---------------------------------------------------------
+# GET MARKET
+# ---------------------------------------------------------
 
 def get_market_by_condition(condition_id):
 
@@ -383,94 +268,135 @@ def get_market_by_condition(condition_id):
 
     except Exception as e:
 
-        print(
-            "⚠️ Feil ved henting av marked:",
-            e
-        )
+        print("⚠️ Feil ved henting av marked:", e)
 
         return None
 
 
-# --------------------------------------------------
-# HENT TOKEN ID FOR OUTCOME
-# --------------------------------------------------
+# ---------------------------------------------------------
+# PARSE JSON ARRAYS
+# ---------------------------------------------------------
 
-def get_token_id(
-    condition_id,
-    outcome
-):
+def parse_json_array(value):
 
-    market = get_market_by_condition(
-        condition_id
-    )
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, str):
+
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+
+    return None
+
+
+# ---------------------------------------------------------
+# GET TOKEN ID
+# ---------------------------------------------------------
+
+def get_token_id(condition_id, outcome):
+
+    market = get_market_by_condition(condition_id)
 
     if not market:
         return None
 
     try:
 
-        outcomes = market.get(
-            "outcomes"
+        outcomes = parse_json_array(
+            market.get("outcomes")
         )
 
-        token_ids = market.get(
-            "clobTokenIds"
+        token_ids = parse_json_array(
+            market.get("clobTokenIds")
         )
-
-
-        if isinstance(
-            outcomes,
-            str
-        ):
-
-            outcomes = json.loads(
-                outcomes
-            )
-
-
-        if isinstance(
-            token_ids,
-            str
-        ):
-
-            token_ids = json.loads(
-                token_ids
-            )
-
 
         if not outcomes or not token_ids:
             return None
 
+        for i, market_outcome in enumerate(outcomes):
 
-        for i, market_outcome in enumerate(
-            outcomes
-        ):
-
-            if str(
-                market_outcome
-            ).strip().lower() == str(
-                outcome
-            ).strip().lower():
+            if (
+                str(market_outcome).strip().lower()
+                ==
+                str(outcome).strip().lower()
+            ):
 
                 if i < len(token_ids):
-
                     return token_ids[i]
-
 
     except Exception as e:
 
-        print(
-            "⚠️ Kunne ikke finne token ID:",
-            e
-        )
-
+        print("⚠️ Kunne ikke finne token ID:", e)
 
     return None
 
 
-# --------------------------------------------------
-# HENT AKTUELL PRIS
-# --------------------------------------------------
+# ---------------------------------------------------------
+# GET SETTLEMENT PRICE
+# ---------------------------------------------------------
+
+def get_settlement_price(condition_id, outcome):
+
+    market = get_market_by_condition(condition_id)
+
+    if not market:
+        return None
+
+    # Vi bruker bare outcomePrices som sluttpris
+    # dersom markedet faktisk er lukket.
+    closed = market.get("closed")
+
+    if not closed:
+        return None
+
+    try:
+
+        outcomes = parse_json_array(
+            market.get("outcomes")
+        )
+
+        prices = parse_json_array(
+            market.get("outcomePrices")
+        )
+
+        if not outcomes or not prices:
+            return None
+
+        for i, market_outcome in enumerate(outcomes):
+
+            if (
+                str(market_outcome).strip().lower()
+                ==
+                str(outcome).strip().lower()
+            ):
+
+                if i < len(prices):
+
+                    price = float(prices[i])
+
+                    print(
+                        "🏁 Bruker sluttpris fra markedet:",
+                        price
+                    )
+
+                    return price
+
+    except Exception as e:
+
+        print(
+            "⚠️ Kunne ikke hente sluttpris:",
+            e
+        )
+
+    return None
+
+
+# ---------------------------------------------------------
+# GET CURRENT PRICE
+# ---------------------------------------------------------
 
 def get_current_price(
     condition_id,
@@ -479,73 +405,58 @@ def get_current_price(
     title=None
 ):
 
-    # --------------------------------------------------
-    # GAMMEL POSITION UTEN CONDITION ID
-    # --------------------------------------------------
-
+    # Reparér gamle posisjoner
     if not condition_id:
 
         if position_id and title:
 
-            condition_id = (
-                repair_position_from_trades(
-                    position_id,
-                    title,
-                    outcome
-                )
+            condition_id = repair_position_from_trades(
+                position_id,
+                title,
+                outcome
             )
 
-
         if not condition_id:
-
             return None
 
+    # Først prøver vi å se om markedet er avsluttet.
+    settlement_price = get_settlement_price(
+        condition_id,
+        outcome
+    )
 
-    # --------------------------------------------------
-    # HENT TOKEN
-    # --------------------------------------------------
+    if settlement_price is not None:
+        return settlement_price
 
+    # Ellers bruker vi vanlig live-pris.
     token_id = get_token_id(
         condition_id,
         outcome
     )
 
-
     if not token_id:
-
         return None
 
-
-    # --------------------------------------------------
     # MIDPOINT
-    # --------------------------------------------------
-
     try:
 
         response = requests.get(
-            "https://clob.polymarket.com/midpoint",
+            CLOB_MIDPOINT_URL,
             params={
                 "token_id": token_id
             },
             timeout=10
         )
 
-
         if response.status_code == 200:
 
             data = response.json()
 
-            midpoint = data.get(
-                "mid"
-            )
-
+            midpoint = data.get("mid")
 
             if midpoint is not None:
 
-                return float(
-                    midpoint
-                )
-
+                return float(midpoint)
 
     except Exception as e:
 
@@ -554,11 +465,7 @@ def get_current_price(
             e
         )
 
-
-    # --------------------------------------------------
-    # FALLBACK: BUY PRICE
-    # --------------------------------------------------
-
+    # BUY PRICE FALLBACK
     try:
 
         response = requests.get(
@@ -570,22 +477,15 @@ def get_current_price(
             timeout=10
         )
 
-
         if response.status_code == 200:
 
             data = response.json()
 
-            price = data.get(
-                "price"
-            )
-
+            price = data.get("price")
 
             if price is not None:
 
-                return float(
-                    price
-                )
-
+                return float(price)
 
     except Exception as e:
 
@@ -594,26 +494,20 @@ def get_current_price(
             e
         )
 
-
     return None
 
 
-# --------------------------------------------------
-# PAPER-KONTO STATUS
-# --------------------------------------------------
+# ---------------------------------------------------------
+# SHOW PAPER ACCOUNT
+# ---------------------------------------------------------
 
 def show_paper_account():
 
     cursor.execute(
-        """
-        SELECT balance
-        FROM paper_account
-        WHERE id = 1
-        """
+        "SELECT balance FROM paper_account WHERE id = 1"
     )
 
     paper_balance = cursor.fetchone()[0]
-
 
     cursor.execute("""
         SELECT
@@ -631,30 +525,25 @@ def show_paper_account():
 
     positions = cursor.fetchall()
 
-
     total_invested = 0
     total_value = 0
-
+    missing_prices = 0
 
     print()
     print("💰 PAPER-KONTO")
     print("=" * 60)
-
 
     print(
         "Saldo:",
         f"{paper_balance:.2f} kr"
     )
 
-
     print(
         "Åpne posisjoner:",
         len(positions)
     )
 
-
     print("-" * 60)
-
 
     for position in positions:
 
@@ -669,7 +558,6 @@ def show_paper_account():
             condition_id
         ) = position
 
-
         current_price = get_current_price(
             condition_id,
             outcome,
@@ -677,71 +565,44 @@ def show_paper_account():
             title
         )
 
-
         total_invested += invested
-
 
         print()
         print("📊 POSISJON")
-
-        print(
-            "Marked:",
-            title
-        )
-
-        print(
-            "Outcome:",
-            outcome
-        )
-
-        print(
-            "Trader:",
-            trader
-        )
-
+        print("Marked:", title)
+        print("Outcome:", outcome)
+        print("Trader:", trader)
         print(
             "Kjøpspris:",
             f"{entry_price:.4f}"
         )
 
-
         if current_price is not None:
 
-            current_value = (
-                shares * current_price
-            )
+            current_value = shares * current_price
 
-
-            profit = (
-                current_value - invested
-            )
-
+            profit = current_value - invested
 
             profit_percent = (
                 profit / invested
             ) * 100
 
-
             total_value += current_value
-
 
             print(
                 "Nåværende pris:",
                 f"{current_price:.4f}"
             )
 
-
             print(
                 "Investert:",
                 f"{invested:.2f} kr"
             )
 
-
             print(
                 "Verdi:",
                 f"{current_value:.2f} kr"
             )
-
 
             if profit >= 0:
 
@@ -759,43 +620,36 @@ def show_paper_account():
                     f"({profit_percent:.2f}%)"
                 )
 
-
         else:
 
-            print(
-                "⚠️ Nåværende pris "
-                "ikke tilgjengelig."
-            )
+            missing_prices += 1
 
+            print(
+                "⚠️ Nåværende pris ikke tilgjengelig."
+            )
 
     print()
     print("-" * 60)
-
 
     print(
         "Totalt investert:",
         f"{total_invested:.2f} kr"
     )
 
-
-    if total_invested > 0:
+    if missing_prices == 0:
 
         print(
             "Markedsverdi:",
             f"{total_value:.2f} kr"
         )
 
-
         total_profit = (
             total_value - total_invested
         )
 
-
         total_profit_percent = (
-            total_profit /
-            total_invested
+            total_profit / total_invested
         ) * 100
-
 
         if total_profit >= 0:
 
@@ -813,18 +667,28 @@ def show_paper_account():
                 f"({total_profit_percent:.2f}%)"
             )
 
+    else:
+
+        print(
+            f"⚠️ {missing_prices} posisjon(er) "
+            "mangler pris."
+        )
+
+        print(
+            "⚠️ Totalt resultat vises ikke "
+            "før alle priser er tilgjengelige."
+        )
 
     print("=" * 60)
 
 
-# --------------------------------------------------
-# TOPP TRADERE
-# --------------------------------------------------
+# ---------------------------------------------------------
+# LEADERBOARD
+# ---------------------------------------------------------
 
 def get_top_traders():
 
     traders = {}
-
 
     for period in [
         "DAY",
@@ -839,7 +703,6 @@ def get_top_traders():
             "orderBy": "PNL",
             "limit": 50
         }
-
 
         try:
 
@@ -858,7 +721,6 @@ def get_top_traders():
 
             continue
 
-
         if response.status_code != 200:
 
             print(
@@ -868,51 +730,43 @@ def get_top_traders():
 
             continue
 
-
         for trader in response.json():
 
             wallet = trader.get(
                 "proxyWallet"
             )
 
-
             if not wallet:
                 continue
-
 
             if wallet not in traders:
 
                 traders[wallet] = {
-                    "name": (
+                    "name":
                         trader.get(
                             "userName"
                         )
-                        or "Ukjent"
-                    ),
+                        or "Ukjent",
+
                     "day": 0,
                     "week": 0,
                     "month": 0,
                     "all": 0
                 }
 
-
             traders[wallet][
                 period.lower()
             ] = (
-                trader.get(
-                    "pnl",
-                    0
-                )
+                trader.get("pnl", 0)
                 or 0
             )
-
 
     return traders
 
 
-# --------------------------------------------------
-# TRADER SCORE
-# --------------------------------------------------
+# ---------------------------------------------------------
+# SCORE
+# ---------------------------------------------------------
 
 def calculate_score(trader):
 
@@ -921,21 +775,17 @@ def calculate_score(trader):
     month = trader["month"]
     all_time = trader["all"]
 
-
-    score = (
-        day * 0.40 +
-        week * 0.30 +
-        month * 0.20 +
-        all_time * 0.10
+    return (
+        day * 0.40
+        + week * 0.30
+        + month * 0.20
+        + all_time * 0.10
     )
 
 
-    return score
-
-
-# --------------------------------------------------
-# HENT TRADES
-# --------------------------------------------------
+# ---------------------------------------------------------
+# TRADES
+# ---------------------------------------------------------
 
 def get_trades(wallet):
 
@@ -943,7 +793,6 @@ def get_trades(wallet):
         "user": wallet,
         "limit": 50
     }
-
 
     try:
 
@@ -957,18 +806,11 @@ def get_trades(wallet):
 
         return []
 
-
     if response.status_code != 200:
-
         return []
-
 
     return response.json()
 
-
-# --------------------------------------------------
-# TRADE ALLEREDE SETT?
-# --------------------------------------------------
 
 def trade_exists(trade_id):
 
@@ -981,18 +823,10 @@ def trade_exists(trade_id):
         (trade_id,)
     )
 
-
     return cursor.fetchone() is not None
 
 
-# --------------------------------------------------
-# TRADE-ID
-# --------------------------------------------------
-
-def create_trade_id(
-    wallet,
-    trade
-):
+def create_trade_id(wallet, trade):
 
     return (
         f"{wallet}-"
@@ -1004,28 +838,20 @@ def create_trade_id(
     )
 
 
-# --------------------------------------------------
-# START
-# --------------------------------------------------
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
 
-print(
-    "🤖 SMART SIGNAL-BOT"
-)
-
+print("🤖 SMART SIGNAL-BOT")
 print("=" * 60)
-
 
 traders = get_top_traders()
 
 scored_traders = []
 
-
 for wallet, trader in traders.items():
 
-    score = calculate_score(
-        trader
-    )
-
+    score = calculate_score(trader)
 
     scored_traders.append({
         "wallet": wallet,
@@ -1033,17 +859,14 @@ for wallet, trader in traders.items():
         "score": score
     })
 
-
 scored_traders.sort(
     key=lambda x: x["score"],
     reverse=True
 )
 
-
 print()
 print("🏆 TOPP TRADERE")
 print("=" * 60)
-
 
 for i, trader in enumerate(
     scored_traders[:20],
@@ -1051,39 +874,31 @@ for i, trader in enumerate(
 ):
 
     print(
-        f"{i}. {trader['name']} "
-        f"| Score: "
+        f"{i}. {trader['name']} | "
+        f"Score: "
         f"${trader['score']:,.0f}"
     )
 
 
-# --------------------------------------------------
-# NYE TRADES
-# --------------------------------------------------
+# ---------------------------------------------------------
+# NEW TRADES
+# ---------------------------------------------------------
 
 print()
 print("=" * 60)
-
-print(
-    "🔎 SJEKKER NYE TRADES"
-)
-
+print("🔎 SJEKKER NYE TRADES")
 print("=" * 60)
 
-
 new_trades = []
-
 
 for trader in scored_traders[:20]:
 
     if trader["score"] <= 0:
         continue
 
-
     trades = get_trades(
         trader["wallet"]
     )
-
 
     for trade in trades:
 
@@ -1092,39 +907,29 @@ for trader in scored_traders[:20]:
             trade
         )
 
-
-        if trade_exists(
-            trade_id
-        ):
-
+        if trade_exists(trade_id):
             continue
-
 
         condition_id = trade.get(
             "conditionId"
         )
 
-
         cursor.execute("""
-        INSERT INTO trades (
-            trade_id,
-            trader,
-            wallet,
-            side,
-            outcome,
-            price,
-            size,
-            title,
-            timestamp,
-            first_seen,
-            condition_id
-        )
-        VALUES (
-            ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?
-        )
+            INSERT INTO trades (
+                trade_id,
+                trader,
+                wallet,
+                side,
+                outcome,
+                price,
+                size,
+                title,
+                timestamp,
+                first_seen,
+                condition_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-
             trade_id,
             trader["name"],
             trader["wallet"],
@@ -1136,75 +941,73 @@ for trader in scored_traders[:20]:
             trade.get("timestamp"),
             datetime.now().isoformat(),
             condition_id
-
         ))
 
-
         new_trades.append({
-            "trader": trader["name"],
-            "score": trader["score"],
-            "side": trade.get("side"),
-            "outcome": trade.get("outcome"),
-            "price": trade.get("price"),
-            "size": trade.get("size"),
-            "title": trade.get("title"),
-            "timestamp": trade.get("timestamp"),
-            "condition_id": condition_id
-        })
+            "trader":
+                trader["name"],
 
+            "score":
+                trader["score"],
+
+            "side":
+                trade.get("side"),
+
+            "outcome":
+                trade.get("outcome"),
+
+            "price":
+                trade.get("price"),
+
+            "size":
+                trade.get("size"),
+
+            "title":
+                trade.get("title"),
+
+            "timestamp":
+                trade.get("timestamp"),
+
+            "condition_id":
+                condition_id
+        })
 
 conn.commit()
 
 
-# --------------------------------------------------
-# SIGNALER
-# --------------------------------------------------
+# ---------------------------------------------------------
+# SIGNALS
+# ---------------------------------------------------------
 
 print()
 print("=" * 60)
-
-print(
-    "🚨 NYE BUY-SIGNALER"
-)
-
+print("🚨 NYE BUY-SIGNALER")
 print("=" * 60)
 
-
 signals = []
-
 
 for trade in new_trades:
 
     if trade["side"] != "BUY":
         continue
 
-
     price = trade["price"] or 0
     size = trade["size"] or 0
 
-
     value = price * size
-
 
     if value < 1000:
         continue
-
 
     signals.append({
         **trade,
         "value": value
     })
 
-
 signals.sort(
     key=lambda x: x["value"],
     reverse=True
 )
-
-
-# --------------------------------------------------
-# BEHANDLE SIGNALER
-# --------------------------------------------------
 
 if not signals:
 
@@ -1213,13 +1016,11 @@ if not signals:
         "Ingen nye sterke BUY-signaler."
     )
 
-
 else:
 
     for signal in signals[:20]:
 
         timestamp = signal["timestamp"]
-
 
         if timestamp:
 
@@ -1233,59 +1034,49 @@ else:
 
             time = "Ukjent"
 
-
         print()
         print("🔥 NYTT SIGNAL")
         print("-" * 50)
-
 
         print(
             "Trader:",
             signal["trader"]
         )
 
-
         print(
             "Score:",
             f"${signal['score']:,.0f}"
         )
-
 
         print(
             "Handling:",
             signal["side"]
         )
 
-
         print(
             "Outcome:",
             signal["outcome"]
         )
-
 
         print(
             "Pris:",
             signal["price"]
         )
 
-
         print(
             "Posisjonsverdi:",
             f"${signal['value']:,.2f}"
         )
-
 
         print(
             "Marked:",
             signal["title"]
         )
 
-
         print(
             "Tid:",
             time
         )
-
 
         paper_buy(
             trader=signal["trader"],
@@ -1297,38 +1088,26 @@ else:
         )
 
 
-# --------------------------------------------------
-# RESULTAT
-# --------------------------------------------------
+# ---------------------------------------------------------
+# SUMMARY
+# ---------------------------------------------------------
 
 print()
 print("=" * 60)
 
-
 print(
     f"📥 {len(new_trades)} "
-    f"nye trades registrert."
+    "nye trades registrert."
 )
-
 
 print(
     f"🚨 {len(signals)} "
-    f"nye BUY-signaler."
+    "nye BUY-signaler."
 )
-
 
 print("=" * 60)
 
-
-# --------------------------------------------------
-# PAPER STATUS
-# --------------------------------------------------
-
 show_paper_account()
 
-
-# --------------------------------------------------
-# FERDIG
-# --------------------------------------------------
-
+conn.commit()
 conn.close()
