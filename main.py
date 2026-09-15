@@ -1,4 +1,5 @@
 import requests
+from datetime import datetime
 
 leaderboard_url = "https://data-api.polymarket.com/v1/leaderboard"
 
@@ -19,42 +20,47 @@ if response.status_code != 200:
 
 traders = response.json()
 
-print("\n=== TOPP 5 TRADERE ===\n")
-
 for trader in traders:
+
     name = trader.get("userName") or "Ukjent"
     wallet = trader.get("proxyWallet")
-    pnl = trader.get("pnl", 0)
-    volume = trader.get("vol", 0)
 
-    print(f"{name}")
-    print(f"PNL: ${pnl:,.2f}")
-    print(f"Volum: ${volume:,.2f}")
-    print(f"Wallet: {wallet}")
+    print("\n" + "=" * 70)
+    print(name)
+    print("=" * 70)
 
-    # Hent de siste 20 tradene til traderen
-    trades_url = "https://data-api.polymarket.com/trades"
+    trade_url = "https://data-api.polymarket.com/trades"
 
     trade_params = {
         "user": wallet,
         "limit": 20
     }
 
-    trade_response = requests.get(trades_url, params=trade_params)
+    trade_response = requests.get(trade_url, params=trade_params)
 
-    if trade_response.status_code == 200:
-        trades = trade_response.json()
-
-        print(f"Antall hentede trades: {len(trades)}")
-
-        for trade in trades[:5]:
-            print(
-                f"  {trade.get('side')} "
-                f"{trade.get('outcome')} "
-                f"@ {trade.get('price')} "
-                f"size={trade.get('size')}"
-            )
-    else:
+    if trade_response.status_code != 200:
         print("Kunne ikke hente trades.")
+        continue
 
-    print("-" * 50)
+    trades = trade_response.json()
+
+    for trade in trades:
+
+        timestamp = trade.get("timestamp")
+
+        if timestamp:
+            time = datetime.fromtimestamp(timestamp).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        else:
+            time = "Ukjent"
+
+        print(
+            f"\n{time}"
+            f"\n  {trade.get('side')} "
+            f"{trade.get('outcome')}"
+            f"\n  Marked: {trade.get('title')}"
+            f"\n  Pris: {trade.get('price')}"
+            f"\n  Størrelse: {trade.get('size')}"
+            f"\n  Market: {trade.get('conditionId')}"
+        )
