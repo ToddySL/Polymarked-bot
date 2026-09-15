@@ -9,10 +9,19 @@ print("Status:", response.status_code)
 if response.status_code == 200:
     trades = response.json()
 
-    print(f"Fant {len(trades)} trades.")
+    print(f"Fant {len(trades)} trades.\n")
 
-    for trade in trades[:10]:
-        print(trade)
+    for trade in trades[:20]:
+        print(
+            "Trader:",
+            trade.get("proxyWallet"),
+            "| Side:",
+            trade.get("side"),
+            "| Pris:",
+            trade.get("price"),
+            "| Størrelse:",
+            trade.get("size")
+        )
 else:
     print("Noe gikk galt:")
     print(response.text)
