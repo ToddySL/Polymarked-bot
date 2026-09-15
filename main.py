@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS trades (
 """)
 
 
-# Hvis gammel database mangler condition_id
+# Gammel database kan mangle condition_id
 try:
     cursor.execute(
         "ALTER TABLE trades ADD COLUMN condition_id TEXT"
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS paper_positions (
 """)
 
 
-# Hvis gammel database mangler condition_id
+# Gammel database kan mangle condition_id
 try:
     cursor.execute(
         "ALTER TABLE paper_positions ADD COLUMN condition_id TEXT"
@@ -183,23 +183,172 @@ def paper_buy(
     print()
     print("💰 PAPER-KJØP")
     print("-" * 50)
+
     print("Trader:", trader)
     print("Outcome:", outcome)
     print("Pris:", price)
+
     print(
         "Investert:",
         f"{PAPER_TRADE_SIZE:.2f} kr"
     )
+
     print(
         "Shares:",
         f"{shares:.2f}"
     )
+
     print(
         "Ny saldo:",
         f"{new_balance:.2f} kr"
     )
 
     return True
+
+
+# --------------------------------------------------
+# REPARER GAMMEL POSITION FRA TRADES-DATABASEN
+# --------------------------------------------------
+
+def repair_position_from_trades(
+    position_id,
+    title,
+    outcome
+):
+
+    print()
+    print(
+        "🔧 Mangler condition_id."
+    )
+
+    print(
+        "🔎 Søker i registrerte trades..."
+    )
+
+    # --------------------------------------------------
+    # FØRSTE FORSØK:
+    # Samme marked + samme outcome
+    # --------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT condition_id, title, outcome
+        FROM trades
+        WHERE condition_id IS NOT NULL
+          AND condition_id != ''
+          AND title = ?
+          AND LOWER(outcome) = LOWER(?)
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        (
+            title,
+            outcome
+        )
+    )
+
+    match = cursor.fetchone()
+
+
+    if match:
+
+        condition_id = match[0]
+
+        print(
+            "✅ Fant match i trades-databasen!"
+        )
+
+        print(
+            "Condition ID:",
+            condition_id
+        )
+
+        cursor.execute(
+            """
+            UPDATE paper_positions
+            SET condition_id = ?
+            WHERE id = ?
+            """,
+            (
+                condition_id,
+                position_id
+            )
+        )
+
+        conn.commit()
+
+        return condition_id
+
+
+    # --------------------------------------------------
+    # ANDRE FORSØK:
+    # Samme marked, uansett outcome
+    #
+    # Dette er nyttig dersom en annen trader
+    # allerede har handlet motsatt side.
+    # --------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT condition_id, title, outcome
+        FROM trades
+        WHERE condition_id IS NOT NULL
+          AND condition_id != ''
+          AND title = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        (title,)
+    )
+
+    match = cursor.fetchone()
+
+
+    if match:
+
+        condition_id = match[0]
+
+        print(
+            "✅ Fant markedet i trades-databasen!"
+        )
+
+        print(
+            "Matchende outcome:",
+            match[2]
+        )
+
+        print(
+            "Condition ID:",
+            condition_id
+        )
+
+        cursor.execute(
+            """
+            UPDATE paper_positions
+            SET condition_id = ?
+            WHERE id = ?
+            """,
+            (
+                condition_id,
+                position_id
+            )
+        )
+
+        conn.commit()
+
+        return condition_id
+
+
+    # --------------------------------------------------
+    # INGENTING FUNNET
+    # --------------------------------------------------
+
+    print(
+        "⚠️ Fant ingen registrert trade "
+        "med dette markedet."
+    )
+
+    return None
 
 
 # --------------------------------------------------
@@ -223,10 +372,6 @@ def get_market_by_condition(condition_id):
         )
 
         if response.status_code != 200:
-            print(
-                "⚠️ Gamma-feil:",
-                response.status_code
-            )
             return None
 
         markets = response.json()
@@ -247,237 +392,13 @@ def get_market_by_condition(condition_id):
 
 
 # --------------------------------------------------
-# FINN GAMMELT MARKED UT FRA TITTEL
-# --------------------------------------------------
-
-def find_market_by_title(title, outcome):
-
-    if not title:
-        return None
-
-    try:
-
-        # q søker i markedets tekst.
-        # Vi bruker hele tittelen først.
-        response = requests.get(
-            GAMMA_MARKET_URL,
-            params={
-                "q": title,
-                "limit": 100
-            },
-            timeout=10
-        )
-
-        if response.status_code != 200:
-            return None
-
-        markets = response.json()
-
-        if not isinstance(markets, list):
-            return None
-
-        title_lower = title.lower().strip()
-        outcome_lower = str(outcome).lower().strip()
-
-        # --------------------------------------------------
-        # 1. Førstevalg:
-        # Finn marked hvor tittelen matcher best
-        # og outcome finnes.
-        # --------------------------------------------------
-
-        best_market = None
-        best_score = -1
-
-        for market in markets:
-
-            question = str(
-                market.get("question") or ""
-            ).lower()
-
-            market_slug = str(
-                market.get("slug") or ""
-            ).lower()
-
-            market_outcomes = market.get(
-                "outcomes"
-            )
-
-            if isinstance(market_outcomes, str):
-
-                try:
-                    market_outcomes = json.loads(
-                        market_outcomes
-                    )
-                except Exception:
-                    market_outcomes = []
-
-            if not isinstance(
-                market_outcomes,
-                list
-            ):
-                market_outcomes = []
-
-
-            score = 0
-
-
-            # Tittelen er helt lik
-            if question == title_lower:
-                score += 100
-
-
-            # Tittelen finnes i spørsmålet
-            elif title_lower in question:
-                score += 80
-
-
-            # Spørsmålet finnes i tittelen
-            elif question in title_lower and question:
-                score += 70
-
-
-            # Ord fra tittelen
-            title_words = [
-                word
-                for word in title_lower.replace(
-                    ":",
-                    " "
-                ).split()
-                if len(word) >= 4
-            ]
-
-            matched_words = sum(
-                1
-                for word in title_words
-                if word in question
-            )
-
-            score += min(
-                matched_words * 5,
-                30
-            )
-
-
-            # Outcome må helst finnes
-            outcome_found = any(
-                str(x).lower().strip()
-                == outcome_lower
-                for x in market_outcomes
-            )
-
-            if outcome_found:
-                score += 50
-
-
-            # Slug kan også gi et lite treff
-            if any(
-                word in market_slug
-                for word in title_words
-            ):
-                score += 5
-
-
-            if score > best_score:
-
-                best_score = score
-                best_market = market
-
-
-        # Krev et minimum av match.
-        if best_market is not None and best_score >= 50:
-
-            return best_market
-
-
-    except Exception as e:
-
-        print(
-            "⚠️ Feil ved søk etter gammelt marked:",
-            e
-        )
-
-
-    return None
-
-
-# --------------------------------------------------
-# REPARER GAMMEL POSITION
-# --------------------------------------------------
-
-def repair_position_condition_id(
-    position_id,
-    title,
-    outcome
-):
-
-    print()
-    print(
-        "🔧 Mangler condition_id. "
-        "Prøver å reparere gammel posisjon..."
-    )
-
-    market = find_market_by_title(
-        title,
-        outcome
-    )
-
-    if not market:
-
-        print(
-            "⚠️ Klarte ikke å finne markedet."
-        )
-
-        return None
-
-
-    condition_id = market.get(
-        "conditionId"
-    )
-
-
-    if not condition_id:
-
-        print(
-            "⚠️ Fant markedet, "
-            "men mangler condition_id."
-        )
-
-        return None
-
-
-    cursor.execute(
-        """
-        UPDATE paper_positions
-        SET condition_id = ?
-        WHERE id = ?
-        """,
-        (
-            condition_id,
-            position_id
-        )
-    )
-
-    conn.commit()
-
-
-    print(
-        "✅ Gammel posisjon reparert!"
-    )
-
-    print(
-        "Condition ID:",
-        condition_id
-    )
-
-
-    return condition_id
-
-
-# --------------------------------------------------
 # HENT TOKEN ID FOR OUTCOME
 # --------------------------------------------------
 
-def get_token_id(condition_id, outcome):
+def get_token_id(
+    condition_id,
+    outcome
+):
 
     market = get_market_by_condition(
         condition_id
@@ -488,20 +409,34 @@ def get_token_id(condition_id, outcome):
 
     try:
 
-        outcomes = market.get("outcomes")
-        token_ids = market.get("clobTokenIds")
+        outcomes = market.get(
+            "outcomes"
+        )
 
-        if isinstance(outcomes, str):
+        token_ids = market.get(
+            "clobTokenIds"
+        )
+
+
+        if isinstance(
+            outcomes,
+            str
+        ):
 
             outcomes = json.loads(
                 outcomes
             )
 
-        if isinstance(token_ids, str):
+
+        if isinstance(
+            token_ids,
+            str
+        ):
 
             token_ids = json.loads(
                 token_ids
             )
+
 
         if not outcomes or not token_ids:
             return None
@@ -513,9 +448,9 @@ def get_token_id(condition_id, outcome):
 
             if str(
                 market_outcome
-            ).lower() == str(
+            ).strip().lower() == str(
                 outcome
-            ).lower():
+            ).strip().lower():
 
                 if i < len(token_ids):
 
@@ -545,24 +480,30 @@ def get_current_price(
 ):
 
     # --------------------------------------------------
-    # Hvis gammel position mangler condition_id,
-    # prøv automatisk å reparere den.
+    # GAMMEL POSITION UTEN CONDITION ID
     # --------------------------------------------------
 
     if not condition_id:
 
         if position_id and title:
 
-            condition_id = repair_position_condition_id(
-                position_id,
-                title,
-                outcome
+            condition_id = (
+                repair_position_from_trades(
+                    position_id,
+                    title,
+                    outcome
+                )
             )
+
 
         if not condition_id:
 
             return None
 
+
+    # --------------------------------------------------
+    # HENT TOKEN
+    # --------------------------------------------------
 
     token_id = get_token_id(
         condition_id,
@@ -571,6 +512,7 @@ def get_current_price(
 
 
     if not token_id:
+
         return None
 
 
@@ -588,11 +530,15 @@ def get_current_price(
             timeout=10
         )
 
+
         if response.status_code == 200:
 
             data = response.json()
 
-            midpoint = data.get("mid")
+            midpoint = data.get(
+                "mid"
+            )
+
 
             if midpoint is not None:
 
@@ -610,7 +556,7 @@ def get_current_price(
 
 
     # --------------------------------------------------
-    # FALLBACK: BUY-PRICE
+    # FALLBACK: BUY PRICE
     # --------------------------------------------------
 
     try:
@@ -624,11 +570,15 @@ def get_current_price(
             timeout=10
         )
 
+
         if response.status_code == 200:
 
             data = response.json()
 
-            price = data.get("price")
+            price = data.get(
+                "price"
+            )
+
 
             if price is not None:
 
@@ -655,7 +605,11 @@ def get_current_price(
 def show_paper_account():
 
     cursor.execute(
-        "SELECT balance FROM paper_account WHERE id = 1"
+        """
+        SELECT balance
+        FROM paper_account
+        WHERE id = 1
+        """
     )
 
     paper_balance = cursor.fetchone()[0]
@@ -686,15 +640,18 @@ def show_paper_account():
     print("💰 PAPER-KONTO")
     print("=" * 60)
 
+
     print(
         "Saldo:",
         f"{paper_balance:.2f} kr"
     )
 
+
     print(
         "Åpne posisjoner:",
         len(positions)
     )
+
 
     print("-" * 60)
 
@@ -726,9 +683,21 @@ def show_paper_account():
 
         print()
         print("📊 POSISJON")
-        print("Marked:", title)
-        print("Outcome:", outcome)
-        print("Trader:", trader)
+
+        print(
+            "Marked:",
+            title
+        )
+
+        print(
+            "Outcome:",
+            outcome
+        )
+
+        print(
+            "Trader:",
+            trader
+        )
 
         print(
             "Kjøpspris:",
@@ -742,9 +711,11 @@ def show_paper_account():
                 shares * current_price
             )
 
+
             profit = (
                 current_value - invested
             )
+
 
             profit_percent = (
                 profit / invested
@@ -759,10 +730,12 @@ def show_paper_account():
                 f"{current_price:.4f}"
             )
 
+
             print(
                 "Investert:",
                 f"{invested:.2f} kr"
             )
+
 
             print(
                 "Verdi:",
@@ -798,6 +771,7 @@ def show_paper_account():
     print()
     print("-" * 60)
 
+
     print(
         "Totalt investert:",
         f"{total_invested:.2f} kr"
@@ -811,12 +785,15 @@ def show_paper_account():
             f"{total_value:.2f} kr"
         )
 
+
         total_profit = (
             total_value - total_invested
         )
 
+
         total_profit_percent = (
-            total_profit / total_invested
+            total_profit /
+            total_invested
         ) * 100
 
 
