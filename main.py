@@ -1,18 +1,18 @@
 import requests
 
-url = "https://gamma-api.polymarket.com/markets"
+url = "https://data-api.polymarket.com/trades"
 
 response = requests.get(url)
 
 print("Status:", response.status_code)
 
 if response.status_code == 200:
-    markets = response.json()
+    trades = response.json()
 
-    print(f"Fant {len(markets)} markeder.")
-    
-    for market in markets[:10]:
-        print(market.get("question"))
+    print(f"Fant {len(trades)} trades.")
+
+    for trade in trades[:10]:
+        print(trade)
 else:
     print("Noe gikk galt:")
     print(response.text)
