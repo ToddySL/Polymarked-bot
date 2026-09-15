@@ -1,66 +1,34 @@
 import requests
-from datetime import datetime
 
-leaderboard_url = "https://data-api.polymarket.com/v1/leaderboard"
+url = "https://data-api.polymarket.com/v1/leaderboard"
 
-params = {
-    "category": "OVERALL",
-    "timePeriod": "ALL",
-    "orderBy": "PNL",
-    "limit": 5
-}
+periods = ["DAY", "WEEK", "MONTH", "ALL"]
 
-response = requests.get(leaderboard_url, params=params)
+for period in periods:
 
-print("Leaderboard status:", response.status_code)
-
-if response.status_code != 200:
-    print(response.text)
-    exit()
-
-traders = response.json()
-
-for trader in traders:
-
-    name = trader.get("userName") or "Ukjent"
-    wallet = trader.get("proxyWallet")
-
-    print("\n" + "=" * 70)
-    print(name)
-    print("=" * 70)
-
-    trade_url = "https://data-api.polymarket.com/trades"
-
-    trade_params = {
-        "user": wallet,
-        "limit": 20
+    params = {
+        "category": "OVERALL",
+        "timePeriod": period,
+        "orderBy": "PNL",
+        "limit": 10
     }
 
-    trade_response = requests.get(trade_url, params=trade_params)
+    response = requests.get(url, params=params)
 
-    if trade_response.status_code != 200:
-        print("Kunne ikke hente trades.")
+    print("\n" + "=" * 70)
+    print(f"TOPP 10 - {period}")
+    print("=" * 70)
+
+    if response.status_code != 200:
+        print("Feil:", response.text)
         continue
 
-    trades = trade_response.json()
+    traders = response.json()
 
-    for trade in trades:
-
-        timestamp = trade.get("timestamp")
-
-        if timestamp:
-            time = datetime.fromtimestamp(timestamp).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        else:
-            time = "Ukjent"
-
+    for trader in traders:
         print(
-            f"\n{time}"
-            f"\n  {trade.get('side')} "
-            f"{trade.get('outcome')}"
-            f"\n  Marked: {trade.get('title')}"
-            f"\n  Pris: {trade.get('price')}"
-            f"\n  Størrelse: {trade.get('size')}"
-            f"\n  Market: {trade.get('conditionId')}"
+            f"{trader.get('rank')}. "
+            f"{trader.get('userName') or 'Ukjent'}"
+            f" | PNL: ${trader.get('pnl'):,.2f}"
+            f" | Vol: ${trader.get('vol'):,.2f}"
         )
