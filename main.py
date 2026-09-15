@@ -247,6 +247,233 @@ def get_market_by_condition(condition_id):
 
 
 # --------------------------------------------------
+# FINN GAMMELT MARKED UT FRA TITTEL
+# --------------------------------------------------
+
+def find_market_by_title(title, outcome):
+
+    if not title:
+        return None
+
+    try:
+
+        # q søker i markedets tekst.
+        # Vi bruker hele tittelen først.
+        response = requests.get(
+            GAMMA_MARKET_URL,
+            params={
+                "q": title,
+                "limit": 100
+            },
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return None
+
+        markets = response.json()
+
+        if not isinstance(markets, list):
+            return None
+
+        title_lower = title.lower().strip()
+        outcome_lower = str(outcome).lower().strip()
+
+        # --------------------------------------------------
+        # 1. Førstevalg:
+        # Finn marked hvor tittelen matcher best
+        # og outcome finnes.
+        # --------------------------------------------------
+
+        best_market = None
+        best_score = -1
+
+        for market in markets:
+
+            question = str(
+                market.get("question") or ""
+            ).lower()
+
+            market_slug = str(
+                market.get("slug") or ""
+            ).lower()
+
+            market_outcomes = market.get(
+                "outcomes"
+            )
+
+            if isinstance(market_outcomes, str):
+
+                try:
+                    market_outcomes = json.loads(
+                        market_outcomes
+                    )
+                except Exception:
+                    market_outcomes = []
+
+            if not isinstance(
+                market_outcomes,
+                list
+            ):
+                market_outcomes = []
+
+
+            score = 0
+
+
+            # Tittelen er helt lik
+            if question == title_lower:
+                score += 100
+
+
+            # Tittelen finnes i spørsmålet
+            elif title_lower in question:
+                score += 80
+
+
+            # Spørsmålet finnes i tittelen
+            elif question in title_lower and question:
+                score += 70
+
+
+            # Ord fra tittelen
+            title_words = [
+                word
+                for word in title_lower.replace(
+                    ":",
+                    " "
+                ).split()
+                if len(word) >= 4
+            ]
+
+            matched_words = sum(
+                1
+                for word in title_words
+                if word in question
+            )
+
+            score += min(
+                matched_words * 5,
+                30
+            )
+
+
+            # Outcome må helst finnes
+            outcome_found = any(
+                str(x).lower().strip()
+                == outcome_lower
+                for x in market_outcomes
+            )
+
+            if outcome_found:
+                score += 50
+
+
+            # Slug kan også gi et lite treff
+            if any(
+                word in market_slug
+                for word in title_words
+            ):
+                score += 5
+
+
+            if score > best_score:
+
+                best_score = score
+                best_market = market
+
+
+        # Krev et minimum av match.
+        if best_market is not None and best_score >= 50:
+
+            return best_market
+
+
+    except Exception as e:
+
+        print(
+            "⚠️ Feil ved søk etter gammelt marked:",
+            e
+        )
+
+
+    return None
+
+
+# --------------------------------------------------
+# REPARER GAMMEL POSITION
+# --------------------------------------------------
+
+def repair_position_condition_id(
+    position_id,
+    title,
+    outcome
+):
+
+    print()
+    print(
+        "🔧 Mangler condition_id. "
+        "Prøver å reparere gammel posisjon..."
+    )
+
+    market = find_market_by_title(
+        title,
+        outcome
+    )
+
+    if not market:
+
+        print(
+            "⚠️ Klarte ikke å finne markedet."
+        )
+
+        return None
+
+
+    condition_id = market.get(
+        "conditionId"
+    )
+
+
+    if not condition_id:
+
+        print(
+            "⚠️ Fant markedet, "
+            "men mangler condition_id."
+        )
+
+        return None
+
+
+    cursor.execute(
+        """
+        UPDATE paper_positions
+        SET condition_id = ?
+        WHERE id = ?
+        """,
+        (
+            condition_id,
+            position_id
+        )
+    )
+
+    conn.commit()
+
+
+    print(
+        "✅ Gammel posisjon reparert!"
+    )
+
+    print(
+        "Condition ID:",
+        condition_id
+    )
+
+
+    return condition_id
+
+
+# --------------------------------------------------
 # HENT TOKEN ID FOR OUTCOME
 # --------------------------------------------------
 
@@ -265,22 +492,35 @@ def get_token_id(condition_id, outcome):
         token_ids = market.get("clobTokenIds")
 
         if isinstance(outcomes, str):
-            outcomes = json.loads(outcomes)
+
+            outcomes = json.loads(
+                outcomes
+            )
 
         if isinstance(token_ids, str):
-            token_ids = json.loads(token_ids)
+
+            token_ids = json.loads(
+                token_ids
+            )
 
         if not outcomes or not token_ids:
             return None
 
-        for i, market_outcome in enumerate(outcomes):
 
-            if str(market_outcome).lower() == str(
+        for i, market_outcome in enumerate(
+            outcomes
+        ):
+
+            if str(
+                market_outcome
+            ).lower() == str(
                 outcome
             ).lower():
 
                 if i < len(token_ids):
+
                     return token_ids[i]
+
 
     except Exception as e:
 
@@ -289,6 +529,7 @@ def get_token_id(condition_id, outcome):
             e
         )
 
+
     return None
 
 
@@ -296,20 +537,49 @@ def get_token_id(condition_id, outcome):
 # HENT AKTUELL PRIS
 # --------------------------------------------------
 
-def get_current_price(condition_id, outcome):
+def get_current_price(
+    condition_id,
+    outcome,
+    position_id=None,
+    title=None
+):
+
+    # --------------------------------------------------
+    # Hvis gammel position mangler condition_id,
+    # prøv automatisk å reparere den.
+    # --------------------------------------------------
+
+    if not condition_id:
+
+        if position_id and title:
+
+            condition_id = repair_position_condition_id(
+                position_id,
+                title,
+                outcome
+            )
+
+        if not condition_id:
+
+            return None
+
 
     token_id = get_token_id(
         condition_id,
         outcome
     )
 
+
     if not token_id:
         return None
 
+
+    # --------------------------------------------------
+    # MIDPOINT
+    # --------------------------------------------------
+
     try:
 
-        # Midpoint er et bedre estimat på
-        # aktuell markedsverdi enn gammel tradepris.
         response = requests.get(
             "https://clob.polymarket.com/midpoint",
             params={
@@ -325,7 +595,11 @@ def get_current_price(condition_id, outcome):
             midpoint = data.get("mid")
 
             if midpoint is not None:
-                return float(midpoint)
+
+                return float(
+                    midpoint
+                )
+
 
     except Exception as e:
 
@@ -335,7 +609,10 @@ def get_current_price(condition_id, outcome):
         )
 
 
-    # Fallback: siste pris
+    # --------------------------------------------------
+    # FALLBACK: BUY-PRICE
+    # --------------------------------------------------
+
     try:
 
         response = requests.get(
@@ -354,7 +631,11 @@ def get_current_price(condition_id, outcome):
             price = data.get("price")
 
             if price is not None:
-                return float(price)
+
+                return float(
+                    price
+                )
+
 
     except Exception as e:
 
@@ -362,6 +643,7 @@ def get_current_price(condition_id, outcome):
             "⚠️ Pris-feil:",
             e
         )
+
 
     return None
 
@@ -433,7 +715,9 @@ def show_paper_account():
 
         current_price = get_current_price(
             condition_id,
-            outcome
+            outcome,
+            position_id,
+            title
         )
 
 
@@ -445,6 +729,7 @@ def show_paper_account():
         print("Marked:", title)
         print("Outcome:", outcome)
         print("Trader:", trader)
+
         print(
             "Kjøpspris:",
             f"{entry_price:.4f}"
@@ -453,9 +738,13 @@ def show_paper_account():
 
         if current_price is not None:
 
-            current_value = shares * current_price
+            current_value = (
+                shares * current_price
+            )
 
-            profit = current_value - invested
+            profit = (
+                current_value - invested
+            )
 
             profit_percent = (
                 profit / invested
@@ -559,6 +848,7 @@ def get_top_traders():
 
     traders = {}
 
+
     for period in [
         "DAY",
         "WEEK",
@@ -573,10 +863,24 @@ def get_top_traders():
             "limit": 50
         }
 
-        response = requests.get(
-            LEADERBOARD_URL,
-            params=params
-        )
+
+        try:
+
+            response = requests.get(
+                LEADERBOARD_URL,
+                params=params,
+                timeout=10
+            )
+
+        except Exception as e:
+
+            print(
+                "⚠️ Leaderboard-feil:",
+                e
+            )
+
+            continue
+
 
         if response.status_code != 200:
 
@@ -593,6 +897,7 @@ def get_top_traders():
             wallet = trader.get(
                 "proxyWallet"
             )
+
 
             if not wallet:
                 continue
@@ -662,12 +967,22 @@ def get_trades(wallet):
         "limit": 50
     }
 
-    response = requests.get(
-        TRADES_URL,
-        params=params
-    )
+
+    try:
+
+        response = requests.get(
+            TRADES_URL,
+            params=params,
+            timeout=10
+        )
+
+    except Exception:
+
+        return []
+
 
     if response.status_code != 200:
+
         return []
 
 
@@ -689,6 +1004,7 @@ def trade_exists(trade_id):
         (trade_id,)
     )
 
+
     return cursor.fetchone() is not None
 
 
@@ -696,7 +1012,10 @@ def trade_exists(trade_id):
 # TRADE-ID
 # --------------------------------------------------
 
-def create_trade_id(wallet, trade):
+def create_trade_id(
+    wallet,
+    trade
+):
 
     return (
         f"{wallet}-"
@@ -712,7 +1031,10 @@ def create_trade_id(wallet, trade):
 # START
 # --------------------------------------------------
 
-print("🤖 SMART SIGNAL-BOT")
+print(
+    "🤖 SMART SIGNAL-BOT"
+)
+
 print("=" * 60)
 
 
@@ -723,7 +1045,10 @@ scored_traders = []
 
 for wallet, trader in traders.items():
 
-    score = calculate_score(trader)
+    score = calculate_score(
+        trader
+    )
+
 
     scored_traders.append({
         "wallet": wallet,
@@ -761,7 +1086,11 @@ for i, trader in enumerate(
 
 print()
 print("=" * 60)
-print("🔎 SJEKKER NYE TRADES")
+
+print(
+    "🔎 SJEKKER NYE TRADES"
+)
+
 print("=" * 60)
 
 
@@ -787,7 +1116,10 @@ for trader in scored_traders[:20]:
         )
 
 
-        if trade_exists(trade_id):
+        if trade_exists(
+            trade_id
+        ):
+
             continue
 
 
@@ -853,7 +1185,11 @@ conn.commit()
 
 print()
 print("=" * 60)
-print("🚨 NYE BUY-SIGNALER")
+
+print(
+    "🚨 NYE BUY-SIGNALER"
+)
+
 print("=" * 60)
 
 
