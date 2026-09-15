@@ -14,20 +14,23 @@ CLOB_PRICE_URL = "https://clob.polymarket.com/price"
 PAPER_START_BALANCE = 400.0
 PAPER_TRADE_SIZE = 40.0
 
-# Hvor stort et salg fra en trader må være for at vi skal reagere.
-# Dette gjelder både BUY og SELL-dataene vi observerer.
+# Maks hvor mye som kan være investert i én bestemt
+# trader + marked + outcome.
+MAX_POSITION_PER_EVENT = 40.0
+
 MIN_TRADE_VALUE_USD = 1000.0
 
-
-# ============================================================
-# DATABASE
-# ============================================================
 
 conn = sqlite3.connect(DB, timeout=30)
 cursor = conn.cursor()
 
 cursor.execute("PRAGMA busy_timeout = 30000")
 cursor.execute("PRAGMA journal_mode = WAL")
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS trades (
@@ -83,7 +86,6 @@ CREATE TABLE IF NOT EXISTS paper_positions (
 )
 """)
 
-# Legg til nye kolonner dersom databasen allerede eksisterer
 for column, definition in [
     ("condition_id", "TEXT"),
     ("sell_price", "REAL"),
@@ -105,17 +107,65 @@ conn.commit()
 # PAPER BUY
 # ============================================================
 
-def paper_buy(
-    trader,
-    outcome,
-    price,
-    title,
-    timestamp,
-    condition_id
-):
+def paper_buy(trader, outcome, price, title, timestamp, condition_id):
+
     if not price or price <= 0:
         print("⚠️ Ugyldig pris. Paper-kjøp hoppes over.")
         return False
+
+    # --------------------------------------------------------
+    # SJEKK MAKS POSISJON PER HENDELSE
+    # --------------------------------------------------------
+
+    if condition_id:
+        cursor.execute("""
+            SELECT COALESCE(SUM(invested), 0)
+            FROM paper_positions
+            WHERE status = 'OPEN'
+              AND trader = ?
+              AND condition_id = ?
+              AND LOWER(outcome) = LOWER(?)
+        """, (trader, condition_id, outcome))
+    else:
+        cursor.execute("""
+            SELECT COALESCE(SUM(invested), 0)
+            FROM paper_positions
+            WHERE status = 'OPEN'
+              AND trader = ?
+              AND LOWER(outcome) = LOWER(?)
+              AND title = ?
+        """, (trader, outcome, title))
+
+    existing_investment = cursor.fetchone()[0] or 0.0
+
+    remaining_limit = MAX_POSITION_PER_EVENT - existing_investment
+
+    if remaining_limit <= 0:
+        print()
+        print("🛑 MAKS GRENSE NÅDD")
+        print("-" * 50)
+        print("Trader:", trader)
+        print("Outcome:", outcome)
+        print("Marked:", title)
+        print("Allerede investert:", f"{existing_investment:.2f} kr")
+        print(
+            "Maks per hendelse:",
+            f"{MAX_POSITION_PER_EVENT:.2f} kr"
+        )
+        print("Nytt paper-kjøp hoppes over.")
+        return False
+
+    # Vi skal aldri investere mer enn det som er igjen
+    # av grensen.
+    trade_amount = min(PAPER_TRADE_SIZE, remaining_limit)
+
+    # Sikkerhet: ikke opprett et merkelig lite kjøp
+    if trade_amount <= 0:
+        return False
+
+    # --------------------------------------------------------
+    # SJEKK PAPER-SALDO
+    # --------------------------------------------------------
 
     cursor.execute(
         "SELECT balance FROM paper_account WHERE id = 1"
@@ -129,15 +179,19 @@ def paper_buy(
 
     balance = row[0]
 
-    if balance < PAPER_TRADE_SIZE:
+    if balance < trade_amount:
         print(
             f"⚠️ Ikke nok paper-penger. "
             f"Saldo: {balance:.2f} kr"
         )
         return False
 
-    shares = PAPER_TRADE_SIZE / price
-    new_balance = balance - PAPER_TRADE_SIZE
+    # --------------------------------------------------------
+    # KJØP
+    # --------------------------------------------------------
+
+    shares = trade_amount / price
+    new_balance = balance - trade_amount
 
     cursor.execute(
         "UPDATE paper_account SET balance = ? WHERE id = 1",
@@ -160,13 +214,16 @@ def paper_buy(
             profit,
             closed_timestamp
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
+        VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            NULL, NULL, NULL, NULL
+        )
     """, (
         trader,
         outcome,
         price,
         shares,
-        PAPER_TRADE_SIZE,
+        trade_amount,
         title,
         timestamp,
         "OPEN",
@@ -181,22 +238,23 @@ def paper_buy(
     print("Trader:", trader)
     print("Outcome:", outcome)
     print("Pris:", price)
-    print("Investert:", f"{PAPER_TRADE_SIZE:.2f} kr")
+    print("Investert:", f"{trade_amount:.2f} kr")
     print("Shares:", f"{shares:.2f}")
+    print("Investert i denne hendelsen totalt:",
+          f"{existing_investment + trade_amount:.2f} kr")
+    print("Maks per hendelse:",
+          f"{MAX_POSITION_PER_EVENT:.2f} kr")
     print("Ny saldo:", f"{new_balance:.2f} kr")
 
     return True
 
 
 # ============================================================
-# REPAIR MANGLENDE CONDITION ID
+# REPAIR CONDITION ID
 # ============================================================
 
-def repair_position_from_trades(
-    position_id,
-    title,
-    outcome
-):
+def repair_position_from_trades(position_id, title, outcome):
+
     print()
     print("🔧 Mangler condition_id.")
     print("🔎 Søker i registrerte trades...")
@@ -259,18 +317,17 @@ def repair_position_from_trades(
 
         return condition_id
 
-    print(
-        "⚠️ Fant ingen registrert trade med dette markedet."
-    )
+    print("⚠️ Fant ingen registrert trade med dette markedet.")
 
     return None
 
 
 # ============================================================
-# GAMMA MARKET
+# MARKET DATA
 # ============================================================
 
 def get_market_by_condition(condition_id):
+
     if not condition_id:
         return None
 
@@ -299,11 +356,8 @@ def get_market_by_condition(condition_id):
         return None
 
 
-# ============================================================
-# JSON ARRAY
-# ============================================================
-
 def parse_json_array(value):
+
     if isinstance(value, list):
         return value
 
@@ -316,11 +370,8 @@ def parse_json_array(value):
     return None
 
 
-# ============================================================
-# TOKEN ID
-# ============================================================
-
 def get_token_id(condition_id, outcome):
+
     market = get_market_by_condition(condition_id)
 
     if not market:
@@ -342,9 +393,9 @@ def get_token_id(condition_id, outcome):
 
             if (
                 str(market_outcome).strip().lower()
-                ==
-                str(outcome).strip().lower()
+                == str(outcome).strip().lower()
             ):
+
                 if i < len(token_ids):
                     return token_ids[i]
 
@@ -354,11 +405,10 @@ def get_token_id(condition_id, outcome):
     return None
 
 
-# ============================================================
-# SETTLEMENT PRICE
-# ============================================================
-
 def get_settlement_price(condition_id, outcome):
+
+    # Rettet: denne funksjonen skal bare sende
+    # condition_id til get_market_by_condition().
     market = get_market_by_condition(condition_id)
 
     if not market:
@@ -385,8 +435,7 @@ def get_settlement_price(condition_id, outcome):
 
             if (
                 str(market_outcome).strip().lower()
-                ==
-                str(outcome).strip().lower()
+                == str(outcome).strip().lower()
             ):
 
                 if i < len(prices):
@@ -406,10 +455,6 @@ def get_settlement_price(condition_id, outcome):
     return None
 
 
-# ============================================================
-# CURRENT PRICE
-# ============================================================
-
 def get_current_price(
     condition_id,
     outcome,
@@ -420,6 +465,7 @@ def get_current_price(
     if not condition_id:
 
         if position_id and title:
+
             condition_id = repair_position_from_trades(
                 position_id,
                 title,
@@ -429,7 +475,6 @@ def get_current_price(
         if not condition_id:
             return None
 
-    # Først: sjekk om markedet er ferdig
     settlement_price = get_settlement_price(
         condition_id,
         outcome
@@ -438,7 +483,6 @@ def get_current_price(
     if settlement_price is not None:
         return settlement_price
 
-    # Finn token
     token_id = get_token_id(
         condition_id,
         outcome
@@ -447,8 +491,12 @@ def get_current_price(
     if not token_id:
         return None
 
-    # Midpoint
+    # --------------------------------------------------------
+    # MIDPOINT
+    # --------------------------------------------------------
+
     try:
+
         response = requests.get(
             CLOB_MIDPOINT_URL,
             params={
@@ -469,8 +517,12 @@ def get_current_price(
     except Exception as e:
         print("⚠️ Midpoint-feil:", e)
 
-    # BUY price fallback
+    # --------------------------------------------------------
+    # BUY PRICE
+    # --------------------------------------------------------
+
     try:
+
         response = requests.get(
             CLOB_PRICE_URL,
             params={
@@ -533,20 +585,20 @@ def paper_sell(
     ) = position
 
     if not sell_price or sell_price <= 0:
+
         print(
             "⚠️ Kunne ikke selge paper-posisjon "
             "fordi salgsprisen mangler."
         )
+
         return False
 
     sell_value = shares * sell_price
     profit = sell_value - invested
 
-    cursor.execute("""
-        SELECT balance
-        FROM paper_account
-        WHERE id = 1
-    """)
+    cursor.execute(
+        "SELECT balance FROM paper_account WHERE id = 1"
+    )
 
     row = cursor.fetchone()
 
@@ -559,11 +611,10 @@ def paper_sell(
 
     now = int(datetime.now().timestamp())
 
-    cursor.execute("""
-        UPDATE paper_account
-        SET balance = ?
-        WHERE id = 1
-    """, (new_balance,))
+    cursor.execute(
+        "UPDATE paper_account SET balance = ? WHERE id = 1",
+        (new_balance,)
+    )
 
     cursor.execute("""
         UPDATE paper_positions
@@ -596,15 +647,9 @@ def paper_sell(
     print("Solgt for:", f"{sell_value:.2f} kr")
 
     if profit >= 0:
-        print(
-            "Resultat:",
-            f"+{profit:.2f} kr"
-        )
+        print("Resultat:", f"+{profit:.2f} kr")
     else:
-        print(
-            "Resultat:",
-            f"{profit:.2f} kr"
-        )
+        print("Resultat:", f"{profit:.2f} kr")
 
     print("Årsak:", reason)
     print("Ny saldo:", f"{new_balance:.2f} kr")
@@ -613,7 +658,7 @@ def paper_sell(
 
 
 # ============================================================
-# MATCH SELL TIL PAPER-POSISJON
+# SELL SIGNAL
 # ============================================================
 
 def process_sell_signal(signal):
@@ -635,7 +680,6 @@ def process_sell_signal(signal):
         f"${signal['value']:,.2f}"
     )
 
-    # Først forsøker vi å matche condition_id
     if condition_id:
 
         cursor.execute("""
@@ -660,7 +704,6 @@ def process_sell_signal(signal):
 
     else:
 
-        # Fallback hvis condition_id mangler
         cursor.execute("""
             SELECT
                 id,
@@ -682,10 +725,12 @@ def process_sell_signal(signal):
         positions = cursor.fetchall()
 
     if not positions:
+
         print(
             "ℹ️ Ingen åpen paper-posisjon "
             "som matcher dette salget."
         )
+
         return 0
 
     closed_count = 0
@@ -704,14 +749,14 @@ def process_sell_signal(signal):
             position_title
         )
 
-        # Hvis vi ikke finner markedet via condition_id,
-        # prøver vi traderens observerte salgspris som fallback.
         if current_price is None:
+
             current_price = signal["price"]
 
             print(
                 "⚠️ Markedspris ikke tilgjengelig."
             )
+
             print(
                 "Bruker traderens observerte salgspris "
                 "som paper-salgspris:",
@@ -729,16 +774,14 @@ def process_sell_signal(signal):
 
 
 # ============================================================
-# SHOW PAPER ACCOUNT
+# PAPER ACCOUNT
 # ============================================================
 
 def show_paper_account():
 
-    cursor.execute("""
-        SELECT balance
-        FROM paper_account
-        WHERE id = 1
-    """)
+    cursor.execute(
+        "SELECT balance FROM paper_account WHERE id = 1"
+    )
 
     paper_balance = cursor.fetchone()[0]
 
@@ -760,10 +803,8 @@ def show_paper_account():
 
     total_invested = 0
     total_value = 0
-
     priced_invested = 0
     priced_value = 0
-
     missing_prices = 0
 
     print()
@@ -916,7 +957,7 @@ def show_paper_account():
 
         print(
             f"⚠️ {missing_prices} "
-            f"posisjon(er) mangler pris."
+            "posisjon(er) mangler pris."
         )
 
         print(
@@ -931,8 +972,7 @@ def show_paper_account():
         )
 
         preliminary_percent = (
-            preliminary_profit /
-            priced_invested
+            preliminary_profit / priced_invested
         ) * 100
 
         print()
@@ -961,7 +1001,6 @@ def show_paper_account():
             f"av {total_invested:.2f} kr"
         )
 
-    # Lukkede posisjoner/resultater
     cursor.execute("""
         SELECT
             COUNT(*),
@@ -1046,15 +1085,16 @@ def get_top_traders():
             continue
 
         try:
+
             leaderboard = response.json()
+
         except Exception:
+
             continue
 
         for trader in leaderboard:
 
-            wallet = trader.get(
-                "proxyWallet"
-            )
+            wallet = trader.get("proxyWallet")
 
             if not wallet:
                 continue
@@ -1074,10 +1114,7 @@ def get_top_traders():
 
             traders[wallet][
                 period.lower()
-            ] = trader.get(
-                "pnl",
-                0
-            ) or 0
+            ] = trader.get("pnl", 0) or 0
 
     return traders
 
@@ -1102,7 +1139,7 @@ def calculate_score(trader):
 
 
 # ============================================================
-# GET TRADES
+# TRADES
 # ============================================================
 
 def get_trades(wallet):
@@ -1121,28 +1158,31 @@ def get_trades(wallet):
         )
 
     except Exception:
+
         return []
 
     if response.status_code != 200:
         return []
 
     try:
+
         return response.json()
+
     except Exception:
+
         return []
 
 
-# ============================================================
-# TRADE ID
-# ============================================================
-
 def trade_exists(trade_id):
 
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT trade_id
         FROM trades
         WHERE trade_id = ?
-    """, (trade_id,))
+        """,
+        (trade_id,)
+    )
 
     return cursor.fetchone() is not None
 
@@ -1160,7 +1200,7 @@ def create_trade_id(wallet, trade):
 
 
 # ============================================================
-# START
+# START BOT
 # ============================================================
 
 print("🤖 SMART SIGNAL-BOT")
@@ -1168,7 +1208,7 @@ print("=" * 60)
 
 
 # ============================================================
-# TOP TRADERS
+# FIND TOP TRADERS
 # ============================================================
 
 traders = get_top_traders()
@@ -1202,8 +1242,7 @@ for i, trader in enumerate(
 ):
 
     print(
-        f"{i}. "
-        f"{trader['name']} | "
+        f"{i}. {trader['name']} | "
         f"Score: ${trader['score']:,.0f}"
     )
 
@@ -1217,7 +1256,9 @@ print("=" * 60)
 print("🔎 SJEKKER NYE TRADES")
 print("=" * 60)
 
+
 new_trades = []
+
 
 for trader in scored_traders[:20]:
 
@@ -1289,11 +1330,12 @@ conn.commit()
 
 
 # ============================================================
-# SEPARATE BUY AND SELL SIGNALS
+# CREATE SIGNALS
 # ============================================================
 
 buy_signals = []
 sell_signals = []
+
 
 for trade in new_trades:
 
@@ -1333,7 +1375,7 @@ sell_signals.sort(
 
 
 # ============================================================
-# SELL FIRST
+# SELL SIGNALS
 # ============================================================
 
 print()
@@ -1341,7 +1383,9 @@ print("=" * 60)
 print("🔴 NYE SELL-SIGNALER")
 print("=" * 60)
 
+
 closed_positions = 0
+
 
 if not sell_signals:
 
@@ -1372,37 +1416,46 @@ else:
 
             time = "Ukjent"
 
+
         print()
         print("🔴 SELL")
         print("-" * 50)
+
         print(
             "Trader:",
             signal["trader"]
         )
+
         print(
             "Score:",
             f"${signal['score']:,.0f}"
         )
+
         print(
             "Handling:",
             signal["side"]
         )
+
         print(
             "Outcome:",
             signal["outcome"]
         )
+
         print(
             "Pris:",
             signal["price"]
         )
+
         print(
             "Posisjonsverdi:",
             f"${signal['value']:,.2f}"
         )
+
         print(
             "Marked:",
             signal["title"]
         )
+
         print(
             "Tid:",
             time
@@ -1423,6 +1476,7 @@ print()
 print("=" * 60)
 print("🚨 NYE BUY-SIGNALER")
 print("=" * 60)
+
 
 if not buy_signals:
 
@@ -1453,37 +1507,46 @@ else:
 
             time = "Ukjent"
 
+
         print()
         print("🔥 NYTT SIGNAL")
         print("-" * 50)
+
         print(
             "Trader:",
             signal["trader"]
         )
+
         print(
             "Score:",
             f"${signal['score']:,.0f}"
         )
+
         print(
             "Handling:",
             signal["side"]
         )
+
         print(
             "Outcome:",
             signal["outcome"]
         )
+
         print(
             "Pris:",
             signal["price"]
         )
+
         print(
             "Posisjonsverdi:",
             f"${signal['value']:,.2f}"
         )
+
         print(
             "Marked:",
             signal["title"]
         )
+
         print(
             "Tid:",
             time
@@ -1508,37 +1571,38 @@ print("=" * 60)
 
 print(
     f"📥 {len(new_trades)} "
-    f"nye trades registrert."
+    "nye trades registrert."
 )
 
 print(
     f"🟢 {len(buy_signals)} "
-    f"nye BUY-signaler."
+    "nye BUY-signaler."
 )
 
 print(
     f"🔴 {len(sell_signals)} "
-    f"nye SELL-signaler."
+    "nye SELL-signaler."
 )
 
 print(
     f"💰 {closed_positions} "
-    f"paper-posisjon(er) solgt."
+    "paper-posisjon(er) solgt."
+)
+
+print(
+    "🛑 Maks per hendelse:",
+    f"{MAX_POSITION_PER_EVENT:.2f} kr"
 )
 
 print("=" * 60)
 
 
 # ============================================================
-# PAPER ACCOUNT
+# SHOW ACCOUNT
 # ============================================================
 
 show_paper_account()
 
-
-# ============================================================
-# CLOSE DATABASE
-# ============================================================
 
 conn.commit()
 conn.close()
