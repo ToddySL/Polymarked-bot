@@ -1,12 +1,45 @@
 import requests
+import sqlite3
 from datetime import datetime
 
+
+DB = "trades.db"
 
 LEADERBOARD_URL = "https://data-api.polymarket.com/v1/leaderboard"
 TRADES_URL = "https://data-api.polymarket.com/trades"
 
 
+# --------------------------------------------------
+# DATABASE
+# --------------------------------------------------
+
+conn = sqlite3.connect(DB)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS trades (
+    trade_id TEXT PRIMARY KEY,
+    trader TEXT,
+    wallet TEXT,
+    side TEXT,
+    outcome TEXT,
+    price REAL,
+    size REAL,
+    title TEXT,
+    timestamp INTEGER,
+    first_seen TEXT
+)
+""")
+
+conn.commit()
+
+
+# --------------------------------------------------
+# TOPP TRADERE
+# --------------------------------------------------
+
 def get_top_traders():
+
     traders = {}
 
     for period in ["DAY", "WEEK", "MONTH", "ALL"]:
@@ -18,7 +51,10 @@ def get_top_traders():
             "limit": 50
         }
 
-        response = requests.get(LEADERBOARD_URL, params=params)
+        response = requests.get(
+            LEADERBOARD_URL,
+            params=params
+        )
 
         if response.status_code != 200:
             print("Feil ved", period)
@@ -32,6 +68,7 @@ def get_top_traders():
                 continue
 
             if wallet not in traders:
+
                 traders[wallet] = {
                     "name": trader.get("userName") or "Ukjent",
                     "day": 0,
@@ -40,10 +77,16 @@ def get_top_traders():
                     "all": 0
                 }
 
-            traders[wallet][period.lower()] = trader.get("pnl", 0) or 0
+            traders[wallet][period.lower()] = (
+                trader.get("pnl", 0) or 0
+            )
 
     return traders
 
+
+# --------------------------------------------------
+# TRADER SCORE
+# --------------------------------------------------
 
 def calculate_score(trader):
 
@@ -52,7 +95,6 @@ def calculate_score(trader):
     month = trader["month"]
     all_time = trader["all"]
 
-    # Ny og mer balansert score
     score = (
         day * 0.40 +
         week * 0.30 +
@@ -63,14 +105,21 @@ def calculate_score(trader):
     return score
 
 
+# --------------------------------------------------
+# HENT TRADES
+# --------------------------------------------------
+
 def get_trades(wallet):
 
     params = {
         "user": wallet,
-        "limit": 20
+        "limit": 50
     }
 
-    response = requests.get(TRADES_URL, params=params)
+    response = requests.get(
+        TRADES_URL,
+        params=params
+    )
 
     if response.status_code != 200:
         return []
@@ -78,7 +127,41 @@ def get_trades(wallet):
     return response.json()
 
 
-print("🤖 SIGNAL-BOT STARTER")
+# --------------------------------------------------
+# SJEKK OM TRADE ALLEREDE ER SETT
+# --------------------------------------------------
+
+def trade_exists(trade_id):
+
+    cursor.execute(
+        "SELECT trade_id FROM trades WHERE trade_id = ?",
+        (trade_id,)
+    )
+
+    return cursor.fetchone() is not None
+
+
+# --------------------------------------------------
+# LAG TRADE-ID
+# --------------------------------------------------
+
+def create_trade_id(wallet, trade):
+
+    return (
+        f"{wallet}-"
+        f"{trade.get('timestamp')}-"
+        f"{trade.get('conditionId')}-"
+        f"{trade.get('side')}-"
+        f"{trade.get('price')}-"
+        f"{trade.get('size')}"
+    )
+
+
+# --------------------------------------------------
+# START
+# --------------------------------------------------
+
+print("🤖 SMART SIGNAL-BOT")
 print("=" * 60)
 
 traders = get_top_traders()
@@ -96,7 +179,6 @@ for wallet, trader in traders.items():
     })
 
 
-# Sorter etter score
 scored_traders.sort(
     key=lambda x: x["score"],
     reverse=True
@@ -115,18 +197,19 @@ for i, trader in enumerate(scored_traders[:20], 1):
     )
 
 
+# --------------------------------------------------
+# NYE TRADES
+# --------------------------------------------------
+
 print()
 print("=" * 60)
-print("🔎 LETER ETTER BUY-SIGNALER")
+print("🔎 SJEKKER NYE TRADES")
 print("=" * 60)
 
+new_trades = []
 
-signals = []
-
-# Se på topp 20
 for trader in scored_traders[:20]:
 
-    # Minimum score
     if trader["score"] <= 0:
         continue
 
@@ -134,42 +217,102 @@ for trader in scored_traders[:20]:
 
     for trade in trades:
 
-        if trade.get("side") != "BUY":
+        trade_id = create_trade_id(
+            trader["wallet"],
+            trade
+        )
+
+        # Allerede sett?
+        if trade_exists(trade_id):
             continue
 
-        price = trade.get("price", 0) or 0
-        size = trade.get("size", 0) or 0
+        # Lagre i database
+        cursor.execute("""
+        INSERT INTO trades (
+            trade_id,
+            trader,
+            wallet,
+            side,
+            outcome,
+            price,
+            size,
+            title,
+            timestamp,
+            first_seen
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
 
-        # Unngå ekstremt små handler
-        position_value = price * size
+            trade_id,
+            trader["name"],
+            trader["wallet"],
+            trade.get("side"),
+            trade.get("outcome"),
+            trade.get("price"),
+            trade.get("size"),
+            trade.get("title"),
+            trade.get("timestamp"),
+            datetime.now().isoformat()
 
-        if position_value < 1000:
-            continue
+        ))
 
-        signals.append({
+        new_trades.append({
             "trader": trader["name"],
             "score": trader["score"],
+            "side": trade.get("side"),
             "outcome": trade.get("outcome"),
-            "price": price,
-            "size": size,
-            "value": position_value,
+            "price": trade.get("price"),
+            "size": trade.get("size"),
             "title": trade.get("title"),
             "timestamp": trade.get("timestamp")
         })
 
 
-# Største signaler først
+conn.commit()
+
+
+# --------------------------------------------------
+# SIGNALER
+# --------------------------------------------------
+
+print()
+print("=" * 60)
+print("🚨 NYE BUY-SIGNALER")
+print("=" * 60)
+
+signals = []
+
+for trade in new_trades:
+
+    if trade["side"] != "BUY":
+        continue
+
+    price = trade["price"] or 0
+    size = trade["size"] or 0
+
+    value = price * size
+
+    # Minimum størrelse
+    if value < 1000:
+        continue
+
+    signals.append({
+        **trade,
+        "value": value
+    })
+
+
 signals.sort(
     key=lambda x: x["value"],
     reverse=True
 )
 
 
-print()
-
 if not signals:
 
-    print("Ingen sterke signaler funnet.")
+    print()
+    print("Ingen nye sterke BUY-signaler.")
+
 
 else:
 
@@ -178,26 +321,51 @@ else:
         timestamp = signal["timestamp"]
 
         if timestamp:
-            time = datetime.fromtimestamp(timestamp).strftime(
-                "%Y-%m-%d %H:%M"
-            )
+
+            time = datetime.fromtimestamp(
+                timestamp
+            ).strftime("%Y-%m-%d %H:%M")
+
         else:
+
             time = "Ukjent"
 
+
         print()
-        print("🔥 SIGNAL")
+        print("🔥 NYTT SIGNAL")
         print("-" * 50)
+
         print("Trader:", signal["trader"])
-        print("Score:", f"${signal['score']:,.0f}")
-        print("Handling: BUY")
+        print(
+            "Score:",
+            f"${signal['score']:,.0f}"
+        )
+
+        print("Handling:", signal["side"])
         print("Outcome:", signal["outcome"])
         print("Pris:", signal["price"])
-        print("Størrelse:", f"${signal['value']:,.2f}")
+
+        print(
+            "Posisjonsverdi:",
+            f"${signal['value']:,.2f}"
+        )
+
         print("Marked:", signal["title"])
         print("Tid:", time)
 
 
 print()
 print("=" * 60)
-print(f"Fant {len(signals)} mulige signaler.")
+
+print(
+    f"📥 {len(new_trades)} nye trades registrert."
+)
+
+print(
+    f"🚨 {len(signals)} nye BUY-signaler."
+)
+
 print("=" * 60)
+
+
+conn.close()
