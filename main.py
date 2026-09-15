@@ -14,9 +14,10 @@ CLOB_PRICE_URL = "https://clob.polymarket.com/price"
 PAPER_START_BALANCE = 400.0
 PAPER_TRADE_SIZE = 40.0
 
-# ---------------------------------------------------------
+
+# =========================================================
 # DATABASE
-# ---------------------------------------------------------
+# =========================================================
 
 conn = sqlite3.connect(DB, timeout=30)
 cursor = conn.cursor()
@@ -73,18 +74,27 @@ CREATE TABLE IF NOT EXISTS paper_positions (
 """)
 
 try:
-    cursor.execute("ALTER TABLE paper_positions ADD COLUMN condition_id TEXT")
+    cursor.execute(
+        "ALTER TABLE paper_positions ADD COLUMN condition_id TEXT"
+    )
 except sqlite3.OperationalError:
     pass
 
 conn.commit()
 
 
-# ---------------------------------------------------------
+# =========================================================
 # PAPER BUY
-# ---------------------------------------------------------
+# =========================================================
 
-def paper_buy(trader, outcome, price, title, timestamp, condition_id):
+def paper_buy(
+    trader,
+    outcome,
+    price,
+    title,
+    timestamp,
+    condition_id
+):
 
     if not price or price <= 0:
         print("⚠️ Ugyldig pris. Paper-kjøp hoppes over.")
@@ -158,17 +168,21 @@ def paper_buy(trader, outcome, price, title, timestamp, condition_id):
     return True
 
 
-# ---------------------------------------------------------
+# =========================================================
 # REPAIR OLD POSITIONS
-# ---------------------------------------------------------
+# =========================================================
 
-def repair_position_from_trades(position_id, title, outcome):
+def repair_position_from_trades(
+    position_id,
+    title,
+    outcome
+):
 
     print()
     print("🔧 Mangler condition_id.")
     print("🔎 Søker i registrerte trades...")
 
-    # Først: samme marked + samme outcome
+    # Samme marked + samme outcome
     cursor.execute("""
         SELECT condition_id, title, outcome
         FROM trades
@@ -199,8 +213,7 @@ def repair_position_from_trades(position_id, title, outcome):
 
         return condition_id
 
-    # Hvis outcome ikke matcher:
-    # søk bare på markedet
+    # Samme marked, uansett outcome
     cursor.execute("""
         SELECT condition_id, title, outcome
         FROM trades
@@ -231,14 +244,16 @@ def repair_position_from_trades(position_id, title, outcome):
 
         return condition_id
 
-    print("⚠️ Fant ingen registrert trade med dette markedet.")
+    print(
+        "⚠️ Fant ingen registrert trade med dette markedet."
+    )
 
     return None
 
 
-# ---------------------------------------------------------
+# =========================================================
 # GET MARKET
-# ---------------------------------------------------------
+# =========================================================
 
 def get_market_by_condition(condition_id):
 
@@ -268,14 +283,17 @@ def get_market_by_condition(condition_id):
 
     except Exception as e:
 
-        print("⚠️ Feil ved henting av marked:", e)
+        print(
+            "⚠️ Feil ved henting av marked:",
+            e
+        )
 
         return None
 
 
-# ---------------------------------------------------------
-# PARSE JSON ARRAYS
-# ---------------------------------------------------------
+# =========================================================
+# JSON ARRAY
+# =========================================================
 
 def parse_json_array(value):
 
@@ -292,13 +310,18 @@ def parse_json_array(value):
     return None
 
 
-# ---------------------------------------------------------
-# GET TOKEN ID
-# ---------------------------------------------------------
+# =========================================================
+# TOKEN ID
+# =========================================================
 
-def get_token_id(condition_id, outcome):
+def get_token_id(
+    condition_id,
+    outcome
+):
 
-    market = get_market_by_condition(condition_id)
+    market = get_market_by_condition(
+        condition_id
+    )
 
     if not market:
         return None
@@ -316,12 +339,18 @@ def get_token_id(condition_id, outcome):
         if not outcomes or not token_ids:
             return None
 
-        for i, market_outcome in enumerate(outcomes):
+        for i, market_outcome in enumerate(
+            outcomes
+        ):
 
             if (
-                str(market_outcome).strip().lower()
+                str(market_outcome)
+                .strip()
+                .lower()
                 ==
-                str(outcome).strip().lower()
+                str(outcome)
+                .strip()
+                .lower()
             ):
 
                 if i < len(token_ids):
@@ -329,24 +358,30 @@ def get_token_id(condition_id, outcome):
 
     except Exception as e:
 
-        print("⚠️ Kunne ikke finne token ID:", e)
+        print(
+            "⚠️ Kunne ikke finne token ID:",
+            e
+        )
 
     return None
 
 
-# ---------------------------------------------------------
-# GET SETTLEMENT PRICE
-# ---------------------------------------------------------
+# =========================================================
+# SETTLEMENT PRICE
+# =========================================================
 
-def get_settlement_price(condition_id, outcome):
+def get_settlement_price(
+    condition_id,
+    outcome
+):
 
-    market = get_market_by_condition(condition_id)
+    market = get_market_by_condition(
+        condition_id
+    )
 
     if not market:
         return None
 
-    # Vi bruker bare outcomePrices som sluttpris
-    # dersom markedet faktisk er lukket.
     closed = market.get("closed")
 
     if not closed:
@@ -365,12 +400,18 @@ def get_settlement_price(condition_id, outcome):
         if not outcomes or not prices:
             return None
 
-        for i, market_outcome in enumerate(outcomes):
+        for i, market_outcome in enumerate(
+            outcomes
+        ):
 
             if (
-                str(market_outcome).strip().lower()
+                str(market_outcome)
+                .strip()
+                .lower()
                 ==
-                str(outcome).strip().lower()
+                str(outcome)
+                .strip()
+                .lower()
             ):
 
                 if i < len(prices):
@@ -394,9 +435,9 @@ def get_settlement_price(condition_id, outcome):
     return None
 
 
-# ---------------------------------------------------------
-# GET CURRENT PRICE
-# ---------------------------------------------------------
+# =========================================================
+# CURRENT PRICE
+# =========================================================
 
 def get_current_price(
     condition_id,
@@ -405,30 +446,33 @@ def get_current_price(
     title=None
 ):
 
-    # Reparér gamle posisjoner
     if not condition_id:
 
         if position_id and title:
 
-            condition_id = repair_position_from_trades(
-                position_id,
-                title,
-                outcome
+            condition_id = (
+                repair_position_from_trades(
+                    position_id,
+                    title,
+                    outcome
+                )
             )
 
         if not condition_id:
             return None
 
-    # Først prøver vi å se om markedet er avsluttet.
-    settlement_price = get_settlement_price(
-        condition_id,
-        outcome
+    # Prøv sluttpris først
+    settlement_price = (
+        get_settlement_price(
+            condition_id,
+            outcome
+        )
     )
 
     if settlement_price is not None:
         return settlement_price
 
-    # Ellers bruker vi vanlig live-pris.
+    # Finn token
     token_id = get_token_id(
         condition_id,
         outcome
@@ -437,7 +481,7 @@ def get_current_price(
     if not token_id:
         return None
 
-    # MIDPOINT
+    # Midpoint
     try:
 
         response = requests.get(
@@ -465,7 +509,7 @@ def get_current_price(
             e
         )
 
-    # BUY PRICE FALLBACK
+    # BUY price fallback
     try:
 
         response = requests.get(
@@ -497,9 +541,9 @@ def get_current_price(
     return None
 
 
-# ---------------------------------------------------------
-# SHOW PAPER ACCOUNT
-# ---------------------------------------------------------
+# =========================================================
+# PAPER ACCOUNT
+# =========================================================
 
 def show_paper_account():
 
@@ -527,6 +571,10 @@ def show_paper_account():
 
     total_invested = 0
     total_value = 0
+
+    priced_invested = 0
+    priced_value = 0
+
     missing_prices = 0
 
     print()
@@ -572,6 +620,7 @@ def show_paper_account():
         print("Marked:", title)
         print("Outcome:", outcome)
         print("Trader:", trader)
+
         print(
             "Kjøpspris:",
             f"{entry_price:.4f}"
@@ -579,15 +628,23 @@ def show_paper_account():
 
         if current_price is not None:
 
-            current_value = shares * current_price
+            current_value = (
+                shares * current_price
+            )
 
-            profit = current_value - invested
+            profit = (
+                current_value - invested
+            )
 
             profit_percent = (
                 profit / invested
             ) * 100
 
             total_value += current_value
+
+            # Foreløpig beregning
+            priced_invested += invested
+            priced_value += current_value
 
             print(
                 "Nåværende pris:",
@@ -636,6 +693,10 @@ def show_paper_account():
         f"{total_invested:.2f} kr"
     )
 
+    # -----------------------------------------------------
+    # VANLIG TOTALT RESULTAT
+    # -----------------------------------------------------
+
     if missing_prices == 0:
 
         print(
@@ -669,9 +730,10 @@ def show_paper_account():
 
     else:
 
+        # Behold advarslene
         print(
-            f"⚠️ {missing_prices} posisjon(er) "
-            "mangler pris."
+            f"⚠️ {missing_prices} "
+            "posisjon(er) mangler pris."
         )
 
         print(
@@ -679,12 +741,52 @@ def show_paper_account():
             "før alle priser er tilgjengelige."
         )
 
+    # -----------------------------------------------------
+    # FORELØPIG RESULTAT
+    # -----------------------------------------------------
+
+    if priced_invested > 0:
+
+        preliminary_profit = (
+            priced_value - priced_invested
+        )
+
+        preliminary_percent = (
+            preliminary_profit / priced_invested
+        ) * 100
+
+        print()
+
+        if preliminary_profit >= 0:
+
+            print(
+                "📈 Foreløpig resultat "
+                "(kun prisede posisjoner):",
+                f"+{preliminary_profit:.2f} kr "
+                f"(+{preliminary_percent:.2f}%)"
+            )
+
+        else:
+
+            print(
+                "📉 Foreløpig resultat "
+                "(kun prisede posisjoner):",
+                f"{preliminary_profit:.2f} kr "
+                f"({preliminary_percent:.2f}%)"
+            )
+
+        print(
+            "Prisede posisjoner:",
+            f"{priced_invested:.2f} kr "
+            f"av {total_invested:.2f} kr"
+        )
+
     print("=" * 60)
 
 
-# ---------------------------------------------------------
+# =========================================================
 # LEADERBOARD
-# ---------------------------------------------------------
+# =========================================================
 
 def get_top_traders():
 
@@ -764,9 +866,9 @@ def get_top_traders():
     return traders
 
 
-# ---------------------------------------------------------
+# =========================================================
 # SCORE
-# ---------------------------------------------------------
+# =========================================================
 
 def calculate_score(trader):
 
@@ -783,9 +885,9 @@ def calculate_score(trader):
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # TRADES
-# ---------------------------------------------------------
+# =========================================================
 
 def get_trades(wallet):
 
@@ -838,9 +940,9 @@ def create_trade_id(wallet, trade):
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # MAIN
-# ---------------------------------------------------------
+# =========================================================
 
 print("🤖 SMART SIGNAL-BOT")
 print("=" * 60)
@@ -880,9 +982,9 @@ for i, trader in enumerate(
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # NEW TRADES
-# ---------------------------------------------------------
+# =========================================================
 
 print()
 print("=" * 60)
@@ -975,9 +1077,9 @@ for trader in scored_traders[:20]:
 conn.commit()
 
 
-# ---------------------------------------------------------
+# =========================================================
 # SIGNALS
-# ---------------------------------------------------------
+# =========================================================
 
 print()
 print("=" * 60)
@@ -1088,9 +1190,9 @@ else:
         )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # SUMMARY
-# ---------------------------------------------------------
+# =========================================================
 
 print()
 print("=" * 60)
