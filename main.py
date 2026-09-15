@@ -3,10 +3,17 @@ import sqlite3
 from datetime import datetime
 
 
+# --------------------------------------------------
+# INNSTILLINGER
+# --------------------------------------------------
+
 DB = "trades.db"
 
 LEADERBOARD_URL = "https://data-api.polymarket.com/v1/leaderboard"
 TRADES_URL = "https://data-api.polymarket.com/trades"
+
+PAPER_START_BALANCE = 400.0
+PAPER_TRADE_SIZE = 40.0
 
 
 # --------------------------------------------------
@@ -16,6 +23,8 @@ TRADES_URL = "https://data-api.polymarket.com/trades"
 conn = sqlite3.connect(DB)
 cursor = conn.cursor()
 
+
+# Vanlige trades
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS trades (
     trade_id TEXT PRIMARY KEY,
@@ -31,7 +40,129 @@ CREATE TABLE IF NOT EXISTS trades (
 )
 """)
 
+
+# Paper-konto
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS paper_account (
+    id INTEGER PRIMARY KEY,
+    balance REAL NOT NULL
+)
+""")
+
+
+# Opprett konto med 400 kr første gang
+cursor.execute("""
+INSERT OR IGNORE INTO paper_account (id, balance)
+VALUES (1, ?)
+""", (PAPER_START_BALANCE,))
+
+
+# Paper-posisjoner
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS paper_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trader TEXT,
+    outcome TEXT,
+    price REAL,
+    shares REAL,
+    invested REAL,
+    title TEXT,
+    timestamp INTEGER,
+    status TEXT
+)
+""")
+
+
 conn.commit()
+
+
+# --------------------------------------------------
+# PAPER TRADING
+# --------------------------------------------------
+
+def paper_buy(trader, outcome, price, title, timestamp):
+
+    # Sikkerhet mot ugyldig pris
+    if not price or price <= 0:
+        print("⚠️ Ugyldig pris. Paper-kjøp hoppes over.")
+        return False
+
+    cursor.execute(
+        "SELECT balance FROM paper_account WHERE id = 1"
+    )
+
+    row = cursor.fetchone()
+
+    if not row:
+        print("❌ Fant ikke paper-konto.")
+        return False
+
+    balance = row[0]
+
+    if balance < PAPER_TRADE_SIZE:
+
+        print(
+            f"⚠️ Ikke nok paper-penger. "
+            f"Saldo: {balance:.2f} kr"
+        )
+
+        return False
+
+    # Hvor mange shares vi får for 40 kr
+    shares = PAPER_TRADE_SIZE / price
+
+    # Trekk 40 kr fra saldo
+    new_balance = balance - PAPER_TRADE_SIZE
+
+    cursor.execute(
+        """
+        UPDATE paper_account
+        SET balance = ?
+        WHERE id = 1
+        """,
+        (new_balance,)
+    )
+
+    # Lagre posisjonen
+    cursor.execute(
+        """
+        INSERT INTO paper_positions (
+            trader,
+            outcome,
+            price,
+            shares,
+            invested,
+            title,
+            timestamp,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trader,
+            outcome,
+            price,
+            shares,
+            PAPER_TRADE_SIZE,
+            title,
+            timestamp,
+            "OPEN"
+        )
+    )
+
+    conn.commit()
+
+    print()
+    print("💰 PAPER-KJØP")
+    print("-" * 50)
+    print("Trader:", trader)
+    print("Outcome:", outcome)
+    print("Pris:", price)
+    print("Investert:", f"{PAPER_TRADE_SIZE:.2f} kr")
+    print("Shares:", f"{shares:.2f}")
+    print("Ny saldo:", f"{new_balance:.2f} kr")
+
+    return True
 
 
 # --------------------------------------------------
@@ -222,11 +353,9 @@ for trader in scored_traders[:20]:
             trade
         )
 
-        # Allerede sett?
         if trade_exists(trade_id):
             continue
 
-        # Lagre i database
         cursor.execute("""
         INSERT INTO trades (
             trade_id,
@@ -308,6 +437,10 @@ signals.sort(
 )
 
 
+# --------------------------------------------------
+# BEHANDLE SIGNALER
+# --------------------------------------------------
+
 if not signals:
 
     print()
@@ -336,6 +469,7 @@ else:
         print("-" * 50)
 
         print("Trader:", signal["trader"])
+
         print(
             "Score:",
             f"${signal['score']:,.0f}"
@@ -354,6 +488,20 @@ else:
         print("Tid:", time)
 
 
+        # Paper-kjøp
+        paper_buy(
+            trader=signal["trader"],
+            outcome=signal["outcome"],
+            price=signal["price"],
+            title=signal["title"],
+            timestamp=signal["timestamp"]
+        )
+
+
+# --------------------------------------------------
+# RESULTAT
+# --------------------------------------------------
+
 print()
 print("=" * 60)
 
@@ -367,5 +515,60 @@ print(
 
 print("=" * 60)
 
+
+# --------------------------------------------------
+# PAPER-KONTO
+# --------------------------------------------------
+
+cursor.execute(
+    "SELECT balance FROM paper_account WHERE id = 1"
+)
+
+paper_balance = cursor.fetchone()[0]
+
+
+cursor.execute("""
+    SELECT SUM(invested)
+    FROM paper_positions
+    WHERE status = 'OPEN'
+""")
+
+paper_invested = cursor.fetchone()[0] or 0
+
+
+cursor.execute("""
+    SELECT COUNT(*)
+    FROM paper_positions
+    WHERE status = 'OPEN'
+""")
+
+paper_positions = cursor.fetchone()[0]
+
+
+print()
+print("💰 PAPER-KONTO")
+print("-" * 50)
+
+print(
+    "Saldo:",
+    f"{paper_balance:.2f} kr"
+)
+
+print(
+    "Investert:",
+    f"{paper_invested:.2f} kr"
+)
+
+print(
+    "Åpne posisjoner:",
+    paper_positions
+)
+
+print("=" * 60)
+
+
+# --------------------------------------------------
+# FERDIG
+# --------------------------------------------------
 
 conn.close()
