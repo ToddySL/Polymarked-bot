@@ -1,32 +1,60 @@
 import requests
 
-url = "https://data-api.polymarket.com/v1/leaderboard"
+leaderboard_url = "https://data-api.polymarket.com/v1/leaderboard"
 
 params = {
     "category": "OVERALL",
     "timePeriod": "ALL",
     "orderBy": "PNL",
-    "limit": 20
+    "limit": 5
 }
 
-response = requests.get(url, params=params)
+response = requests.get(leaderboard_url, params=params)
 
-print("Status:", response.status_code)
+print("Leaderboard status:", response.status_code)
 
-if response.status_code == 200:
-    traders = response.json()
-
-    print(f"\nFant {len(traders)} topptradere:\n")
-
-    for trader in traders:
-        print(
-            f"#{trader.get('rank')} "
-            f"{trader.get('userName') or 'Ukjent'} | "
-            f"PNL: ${trader.get('pnl'):,.2f} | "
-            f"Volum: ${trader.get('vol'):,.2f} | "
-            f"Wallet: {trader.get('proxyWallet')}"
-        )
-
-else:
-    print("Noe gikk galt:")
+if response.status_code != 200:
     print(response.text)
+    exit()
+
+traders = response.json()
+
+print("\n=== TOPP 5 TRADERE ===\n")
+
+for trader in traders:
+    name = trader.get("userName") or "Ukjent"
+    wallet = trader.get("proxyWallet")
+    pnl = trader.get("pnl", 0)
+    volume = trader.get("vol", 0)
+
+    print(f"{name}")
+    print(f"PNL: ${pnl:,.2f}")
+    print(f"Volum: ${volume:,.2f}")
+    print(f"Wallet: {wallet}")
+
+    # Hent de siste 20 tradene til traderen
+    trades_url = "https://data-api.polymarket.com/trades"
+
+    trade_params = {
+        "user": wallet,
+        "limit": 20
+    }
+
+    trade_response = requests.get(trades_url, params=trade_params)
+
+    if trade_response.status_code == 200:
+        trades = trade_response.json()
+
+        print(f"Antall hentede trades: {len(trades)}")
+
+        for trade in trades[:5]:
+            print(
+                f"  {trade.get('side')} "
+                f"{trade.get('outcome')} "
+                f"@ {trade.get('price')} "
+                f"size={trade.get('size')}"
+            )
+    else:
+        print("Kunne ikke hente trades.")
+
+    print("-" * 50)
