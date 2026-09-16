@@ -118,7 +118,12 @@ def parse_json_array(value):
 def get_market_by_condition(condition_id):
 
     if not condition_id:
+        print("⚠️ Ingen condition_id.")
         return None
+
+    print()
+    print("🔍 DEBUG: Henter marked")
+    print("Condition ID:", condition_id)
 
     try:
         response = requests.get(
@@ -130,17 +135,20 @@ def get_market_by_condition(condition_id):
             timeout=10
         )
 
+        print("HTTP-status:", response.status_code)
+        print("URL:", response.url)
+
+        print("Svar:")
+        print(response.text[:2000])
+
         if response.status_code != 200:
-            print(
-                "⚠️ Gamma-feil:",
-                response.status_code
-            )
             return None
 
         data = response.json()
 
         if isinstance(data, list):
             if data:
+                print("✅ Fant marked!")
                 return data[0]
 
         elif isinstance(data, dict):
@@ -148,10 +156,13 @@ def get_market_by_condition(condition_id):
             markets = data.get("markets")
 
             if markets:
+                print("✅ Fant marked!")
                 return markets[0]
 
+        print("❌ Fant ingen marked i svaret.")
+
     except Exception as e:
-        print("⚠️ Feil ved henting av marked:", e)
+        print("❌ API-feil:", repr(e))
 
     return None
 
