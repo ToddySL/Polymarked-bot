@@ -8,6 +8,8 @@ DB = "trades.db"
 LEADERBOARD_URL = "https://data-api.polymarket.com/v1/leaderboard"
 TRADES_URL = "https://data-api.polymarket.com/trades"
 GAMMA_MARKET_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
+CLOB_MARKET_BY_TOKEN_URL = "https://clob.polymarket.com/markets-by-token"
 CLOB_MIDPOINT_URL = "https://clob.polymarket.com/midpoint"
 CLOB_PRICE_URL = "https://clob.polymarket.com/price"
 
@@ -48,6 +50,11 @@ try:
 except sqlite3.OperationalError:
     pass
 
+try:
+    cursor.execute("ALTER TABLE trades ADD COLUMN asset TEXT")
+except sqlite3.OperationalError:
+    pass
+
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS paper_account (
@@ -83,6 +90,8 @@ CREATE TABLE IF NOT EXISTS paper_positions (
 
 for column, definition in [
     ("condition_id", "TEXT"),
+    ("asset", "TEXT"),
+    ("wallet", "TEXT"),
     ("sell_price", "REAL"),
     ("sell_value", "REAL"),
     ("profit", "REAL"),
@@ -99,185 +108,227 @@ conn.commit()
 
 
 # ============================================================
-# HELPERS
+# HELPERS / MARKET LOOKUP
 # ============================================================
 
 def parse_json_array(value):
     if isinstance(value, list):
         return value
-
     if isinstance(value, str):
         try:
             return json.loads(value)
         except Exception:
             return None
-
     return None
+
+
+def normalize_text(value):
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().lower().split())
+
+
+def request_json(url, params=None, timeout=10):
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=timeout
+        )
+        if response.status_code != 200:
+            return None
+        return response.json()
+    except Exception:
+        return None
 
 
 def get_market_by_condition(condition_id, title=None):
     """
-    Hent marked via condition_id først.
-
-    Hvis Gamma svarer 200 + [] på condition_ids, bruker vi
-    markedstittelen som fallback. Dette løser markeder som ikke
-    lenger blir funnet via condition_id-filteret.
+    Lookup order:
+    1. /markets via condition_ids
+    2. Official /public-search via q
     """
     if condition_id:
-        try:
-            response = requests.get(
-                GAMMA_MARKET_URL,
-                params={"condition_ids": condition_id, "limit": 1},
-                timeout=10
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, list) and data:
-                    return data[0]
-                if isinstance(data, dict) and data.get("markets"):
-                    return data["markets"][0]
-        except Exception as e:
-            print("⚠️ Condition-ID lookup feilet:", repr(e))
+        data = request_json(
+            GAMMA_MARKET_URL,
+            {"condition_ids": condition_id, "limit": 1}
+        )
+
+        if isinstance(data, list) and data:
+            return data[0]
+
+        if isinstance(data, dict) and data.get("markets"):
+            return data["markets"][0]
 
     if not title:
         return None
 
-    print("🔎 Fallback: søker marked via tittel:", title)
-    wanted = str(title).strip().lower()
+    # IMPORTANT:
+    # /markets is a list endpoint, not the search endpoint.
+    # /public-search is specifically designed for this.
+    data = request_json(
+        GAMMA_SEARCH_URL,
+        {
+            "q": title,
+            "limit_per_type": 20,
+            "page": 1,
+            "keep_closed_markets": 1,
+            "search_profiles": "false",
+            "search_tags": "false"
+        }
+    )
 
-    # Gamma sitt q-søk er hovedfallbacken. Vi gjør også en bredere
-    # forespørsel dersom q-søket ikke gir treff.
-    attempts = [
-        {"q": title, "limit": 100},
-        {"q": " ".join(wanted.split()[:10]), "limit": 100},
-    ]
+    if not isinstance(data, dict):
+        return None
 
-    for params in attempts:
-        try:
-            response = requests.get(
-                GAMMA_MARKET_URL,
-                params=params,
-                timeout=10
-            )
-            if response.status_code != 200:
-                continue
+    wanted = normalize_text(title)
+    candidates = []
 
-            data = response.json()
-            markets = data.get("markets", []) if isinstance(data, dict) else data
-            if not isinstance(markets, list):
-                continue
+    for event in data.get("events") or []:
+        candidates.extend(event.get("markets") or [])
 
-            # Eksakt question/title-match først.
-            for market in markets:
-                market_title = str(
-                    market.get("question") or market.get("title") or ""
-                ).strip().lower()
-                if market_title == wanted:
-                    print("✅ Fant marked via eksakt tittel!")
-                    return market
+    # Exact question match first.
+    for market in candidates:
+        question = normalize_text(
+            market.get("question") or market.get("title")
+        )
+        if question == wanted:
+            return market
 
-            # Deretter en tolerant tekstmatch.
-            words = [w for w in wanted.replace(":", " ").split() if len(w) >= 4]
-            best = None
-            best_score = 0
-            for market in markets:
-                market_title = str(
-                    market.get("question") or market.get("title") or ""
-                ).strip().lower()
-                score = sum(1 for w in words if w in market_title)
-                if score > best_score:
-                    best_score = score
-                    best = market
+    # Conservative fuzzy fallback.
+    words = {
+        w for w in wanted.replace(":", " ").split()
+        if len(w) >= 4
+    }
 
-            if best is not None and best_score >= min(3, len(words)):
-                print("✅ Fant marked via tekstmatch!")
-                return best
+    best = None
+    best_score = 0
 
-        except Exception as e:
-            print("⚠️ Fallback lookup-feil:", repr(e))
+    for market in candidates:
+        question = normalize_text(
+            market.get("question") or market.get("title")
+        )
+        score = sum(1 for w in words if w in question)
 
-    print("❌ Fant ikke marked via fallback.")
+        if score > best_score:
+            best_score = score
+            best = market
+
+    if best is not None and best_score >= min(4, max(1, len(words))):
+        return best
+
     return None
 
 
-def get_token_id(condition_id, outcome, title=None):
+def get_market_by_token(token_id):
+    if not token_id:
+        return None
 
-    market = get_market_by_condition(condition_id, title)
+    return request_json(
+        f"{CLOB_MARKET_BY_TOKEN_URL}/{token_id}"
+    )
 
+
+def get_token_id_from_market(market, outcome):
     if not market:
         return None
 
-    outcomes = parse_json_array(
-        market.get("outcomes")
-    )
-
-    token_ids = parse_json_array(
-        market.get("clobTokenIds")
-    )
+    outcomes = parse_json_array(market.get("outcomes"))
+    token_ids = parse_json_array(market.get("clobTokenIds"))
 
     if not outcomes or not token_ids:
         return None
 
+    wanted = normalize_text(outcome)
+
     for i, market_outcome in enumerate(outcomes):
-
-        if (
-            str(market_outcome).strip().lower()
-            == str(outcome).strip().lower()
-        ):
-
+        if normalize_text(market_outcome) == wanted:
             if i < len(token_ids):
                 return str(token_ids[i])
 
     return None
 
 
-# ============================================================
-# SETTLEMENT / CURRENT PRICE
-# ============================================================
-
-def get_settlement_price(condition_id, outcome, title=None):
+def get_token_id(condition_id, outcome, title=None, asset=None):
+    # The trade's asset is the strongest identifier we have.
+    if asset:
+        return str(asset)
 
     market = get_market_by_condition(condition_id, title)
+    return get_token_id_from_market(market, outcome)
 
-    if not market:
+
+def get_settlement_price(
+    condition_id,
+    outcome,
+    title=None,
+    asset=None
+):
+    market = get_market_by_condition(condition_id, title)
+
+    if not market or not market.get("closed"):
         return None
 
-    outcomes = parse_json_array(
-        market.get("outcomes")
-    )
-
-    prices = parse_json_array(
-        market.get("outcomePrices")
-    )
+    outcomes = parse_json_array(market.get("outcomes"))
+    prices = parse_json_array(market.get("outcomePrices"))
 
     if not outcomes or not prices:
         return None
 
-    closed = market.get("closed")
-
-    # Marketet må være lukket for at vi skal bruke
-    # outcomePrices som endelig settlement.
-    if not closed:
-        return None
+    wanted = normalize_text(outcome)
 
     for i, market_outcome in enumerate(outcomes):
+        if normalize_text(market_outcome) == wanted:
+            if i >= len(prices):
+                return None
+            try:
+                price = float(prices[i])
+                if 0 <= price <= 1:
+                    return price
+            except Exception:
+                pass
 
-        if (
-            str(market_outcome).strip().lower()
-            == str(outcome).strip().lower()
-        ):
+    return None
 
-            if i < len(prices):
 
-                try:
-                    price = float(prices[i])
+def get_clob_price(token_id):
+    if not token_id:
+        return None
 
-                    # Bare gyldige prediction-market-priser
-                    if 0.0 <= price <= 1.0:
-                        return price
+    for url, params in [
+        (
+            CLOB_MIDPOINT_URL,
+            {"token_id": token_id}
+        ),
+        (
+            CLOB_PRICE_URL,
+            {"token_id": token_id, "side": "BUY"}
+        )
+    ]:
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=10
+            )
 
-                except Exception:
-                    return None
+            if response.status_code != 200:
+                continue
+
+            data = response.json()
+            value = (
+                data.get("mid")
+                if "mid" in data
+                else data.get("price")
+            )
+
+            if value is not None:
+                price = float(value)
+                if 0 <= price <= 1:
+                    return price
+
+        except Exception:
+            continue
 
     return None
 
@@ -286,147 +337,171 @@ def get_current_price(
     condition_id,
     outcome,
     position_id=None,
-    title=None
+    title=None,
+    asset=None
 ):
+    # First try the stored token/condition data.
+    if position_id:
+        repaired = repair_position_market_data(
+            position_id,
+            title,
+            outcome
+        )
 
-    if not condition_id:
-
-        if position_id and title:
-            condition_id = repair_position_from_trades(
-                position_id,
-                title,
-                outcome
+        if repaired:
+            condition_id = (
+                repaired.get("condition_id")
+                or condition_id
+            )
+            asset = (
+                repaired.get("asset")
+                or asset
             )
 
-        if not condition_id:
-            return None
-
-    # --------------------------------------------------------
-    # FØRST: SJEKK OM MARKEDET ER AVGJORT
-    # --------------------------------------------------------
-
-    settlement_price = get_settlement_price(
+    settlement = get_settlement_price(
         condition_id,
         outcome,
-        title
+        title,
+        asset
     )
 
-    if settlement_price is not None:
-        return settlement_price
-
-    # --------------------------------------------------------
-    # ELLERS: LIVE CLOB-PRIS
-    # --------------------------------------------------------
+    if settlement is not None:
+        return settlement
 
     token_id = get_token_id(
         condition_id,
         outcome,
-        title
+        title,
+        asset
     )
 
-    if not token_id:
+    return get_clob_price(token_id)
+
+
+# ============================================================
+# REPAIR OLD POSITIONS
+# ============================================================
+
+def find_asset_in_trader_history(
+    wallet,
+    title,
+    outcome,
+    timestamp=None
+):
+    if not wallet:
         return None
 
-    try:
+    trades = get_trades(wallet, limit=200)
+    wanted_title = normalize_text(title)
+    wanted_outcome = normalize_text(outcome)
 
-        response = requests.get(
-            CLOB_MIDPOINT_URL,
-            params={
-                "token_id": token_id
-            },
-            timeout=10
+    candidates = []
+
+    for trade in trades:
+        if normalize_text(trade.get("title")) != wanted_title:
+            continue
+        if normalize_text(trade.get("outcome")) != wanted_outcome:
+            continue
+
+        asset = trade.get("asset")
+        if not asset:
+            continue
+
+        trade_ts = trade.get("timestamp")
+        distance = 0
+
+        try:
+            if timestamp and trade_ts:
+                distance = abs(int(trade_ts) - int(timestamp))
+        except Exception:
+            pass
+
+        candidates.append((distance, str(asset)))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def repair_position_market_data(
+    position_id,
+    title,
+    outcome
+):
+    cursor.execute("""
+        SELECT
+            condition_id,
+            asset,
+            wallet,
+            timestamp
+        FROM paper_positions
+        WHERE id = ?
+    """, (position_id,))
+
+    row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    condition_id, asset, wallet, timestamp = row
+
+    # New positions should already have an asset.
+    if asset:
+        return {
+            "condition_id": condition_id,
+            "asset": asset,
+            "wallet": wallet
+        }
+
+    # Recover the token directly from the original trader's history.
+    if wallet:
+        recovered_asset = find_asset_in_trader_history(
+            wallet,
+            title,
+            outcome,
+            timestamp
         )
 
-        if response.status_code == 200:
+        if recovered_asset:
+            cursor.execute("""
+                UPDATE paper_positions
+                SET asset = ?
+                WHERE id = ?
+            """, (recovered_asset, position_id))
 
-            data = response.json()
+            conn.commit()
 
-            midpoint = data.get("mid")
+            return {
+                "condition_id": condition_id,
+                "asset": recovered_asset,
+                "wallet": wallet
+            }
 
-            if midpoint is not None:
-
-                price = float(midpoint)
-
-                if 0 <= price <= 1:
-                    return price
-
-    except Exception as e:
-        print("⚠️ Midpoint-feil:", e)
-
-    try:
-
-        response = requests.get(
-            CLOB_PRICE_URL,
-            params={
-                "token_id": token_id,
-                "side": "BUY"
-            },
-            timeout=10
-        )
-
-        if response.status_code == 200:
-
-            data = response.json()
-
-            price = data.get("price")
-
-            if price is not None:
-
-                price = float(price)
-
-                if 0 <= price <= 1:
-                    return price
-
-    except Exception as e:
-        print("⚠️ Pris-feil:", e)
+    # Existing DB rows may not have wallet.
+    # Fall back to the stored condition ID.
+    if condition_id:
+        return {
+            "condition_id": condition_id,
+            "asset": None,
+            "wallet": wallet
+        }
 
     return None
 
-
-# ============================================================
-# REPAIR CONDITION ID
-# ============================================================
 
 def repair_position_from_trades(
     position_id,
     title,
     outcome
 ):
-
-    cursor.execute("""
-        SELECT condition_id
-        FROM trades
-        WHERE condition_id IS NOT NULL
-          AND condition_id != ''
-          AND title = ?
-          AND LOWER(outcome) = LOWER(?)
-        ORDER BY timestamp DESC
-        LIMIT 1
-    """, (
+    repaired = repair_position_market_data(
+        position_id,
         title,
         outcome
-    ))
-
-    match = cursor.fetchone()
-
-    if match:
-
-        condition_id = match[0]
-
-        cursor.execute("""
-            UPDATE paper_positions
-            SET condition_id = ?
-            WHERE id = ?
-        """, (
-            condition_id,
-            position_id
-        ))
-
-        conn.commit()
-
-        return condition_id
-
-    return None
+    )
+    return repaired.get("condition_id") if repaired else None
 
 
 # ============================================================
@@ -481,7 +556,9 @@ def paper_buy(
     price,
     title,
     timestamp,
-    condition_id
+    condition_id,
+    wallet=None,
+    asset=None
 ):
 
     if not price or price <= 0:
@@ -626,13 +703,15 @@ def paper_buy(
             timestamp,
             status,
             condition_id,
+            asset,
+            wallet,
             sell_price,
             sell_value,
             profit,
             closed_timestamp
         )
         VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             NULL, NULL, NULL, NULL
         )
     """, (
@@ -644,7 +723,9 @@ def paper_buy(
         title,
         timestamp,
         "OPEN",
-        condition_id
+        condition_id,
+        asset,
+        wallet
     ))
 
     conn.commit()
@@ -1149,9 +1230,10 @@ for trader in scored_traders[:20]:
                 title,
                 timestamp,
                 first_seen,
-                condition_id
+                condition_id,
+                asset
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             trade_id,
             trader["name"],
@@ -1163,7 +1245,8 @@ for trader in scored_traders[:20]:
             trade.get("title"),
             trade.get("timestamp"),
             datetime.now().isoformat(),
-            condition_id
+            condition_id,
+            trade.get("asset")
         ))
 
         new_trades.append({
@@ -1176,7 +1259,8 @@ for trader in scored_traders[:20]:
             "size": trade.get("size"),
             "title": trade.get("title"),
             "timestamp": trade.get("timestamp"),
-            "condition_id": condition_id
+            "condition_id": condition_id,
+            "asset": trade.get("asset")
         })
 
 
@@ -1394,7 +1478,9 @@ else:
             price=signal["price"],
             title=signal["title"],
             timestamp=signal["timestamp"],
-            condition_id=signal["condition_id"]
+            condition_id=signal["condition_id"],
+            wallet=signal["wallet"],
+            asset=signal.get("asset")
         )
 
 
@@ -1460,7 +1546,8 @@ cursor.execute("""
         shares,
         invested,
         title,
-        condition_id
+        condition_id,
+        asset
     FROM paper_positions
     WHERE status = 'OPEN'
 """)
@@ -1488,7 +1575,8 @@ for position in positions:
         shares,
         invested,
         title,
-        condition_id
+        condition_id,
+        asset
     ) = position
 
     total_invested += invested
@@ -1497,7 +1585,8 @@ for position in positions:
         condition_id,
         outcome,
         position_id,
-        title
+        title,
+        asset
     )
 
     print()
