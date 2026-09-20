@@ -425,6 +425,1156 @@ def find_asset_in_trader_history(
     return candidates[0][1]
 
 
+def repair_position_market_data(position_id, title, outcome):
+    """Recover missing wallet/token metadata without changing paper-account history."""
+    cursor.execute("""
+        SELECT condition_id, asset, wallet, timestamp, trader
+        FROM paper_positions WHERE id = ?
+    """, (position_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+
+    condition_id, asset, wallet, timestamp, trader_name = row
+
+    # Recover legacy wallet from locally stored observed trades first.
+    if not wallet and trader_name:
+        try:
+            cursor.execute("""
+                SELECT wallet FROM trades
+                WHERE LOWER(COALESCE(trader, '')) = LOWER(?)
+                  AND wallet IS NOT NULL AND wallet != ''
+                ORDER BY timestamp DESC LIMIT 1
+            """, (trader_name,))
+            found = cursor.fetchone()
+            if found:
+                wallet = found[0]
+                cursor.execute("UPDATE paper_positions SET wallet = ? WHERE id = ?",
+                               (wallet, position_id))
+                conn.commit()
+        except sqlite3.Error:
+            pass
+
+    # If not present locally, try matching the trader name against leaderboard data.
+    if not wallet and trader_name:
+        try:
+            leaderboard = get_top_traders()
+            for candidate_wallet, info in leaderboard.items():
+                if normalize_text(info.get("name")) == normalize_text(trader_name):
+                    wallet = candidate_wallet
+                    cursor.execute("UPDATE paper_positions SET wallet = ? WHERE id = ?",
+                                   (wallet, position_id))
+                    conn.commit()
+                    break
+        except Exception:
+            pass
+
+    if not asset and wallet:
+        try:
+            asset = find_asset_in_trader_history(wallet, title, outcome, timestamp)
+        except Exception as exc:
+            print(f"⚠️ Kunne ikke reparere token for posisjon {position_id}: {exc}")
+        if asset:
+            cursor.execute("UPDATE paper_positions SET asset = ?, wallet = ? WHERE id = ?",
+                           (asset, wallet, position_id))
+            conn.commit()
+
+    return {"condition_id": condition_id, "asset": asset, "wallet": wallet}
+
+
+
+def calculate_score(trader):
+
+    return (
+        trader["day"] * 0.40
+        + trader["week"] * 0.30
+        + trader["month"] * 0.20
+        + trader["all"] * 0.10
+    )
+
+
+# ============================================================
+# TRADES
+# ============================================================
+
+def get_trades(wallet, limit=200):
+
+    try:
+
+        response = requests.get(
+            TRADES_URL,
+            params={
+                "user": wallet,
+                "limit": max(1, min(int(limit), 500))
+            },
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return []
+
+        return response.json()
+
+    except Exception:
+
+        return []
+
+
+def trade_exists(trade_id):
+
+    cursor.execute("""
+        SELECT trade_id
+        FROM trades
+        WHERE trade_id = ?
+    """, (
+        trade_id,
+    ))
+
+    return cursor.fetchone() is not None
+
+
+def create_trade_id(wallet, trade):
+
+    return (
+        f"{wallet}-"
+        f"{trade.get('timestamp')}-"
+        f"{trade.get('conditionId')}-"
+        f"{trade.get('side')}-"
+        f"{trade.get('price')}-"
+        f"{trade.get('size')}"
+    )
+
+
+# ============================================================
+# START
+# ============================================================
+
+print("🤖 SMART SIGNAL-BOT")
+print("=" * 60)
+
+
+# Først gjør vi opp gamle posisjoner som eventuelt
+# allerede er avgjort.
+settle_closed_positions()
+
+
+# ============================================================
+# TOP TRADERS
+# ============================================================
+
+traders = get_top_traders()
+
+scored_traders = []
+
+for wallet, trader in traders.items():
+
+    score = calculate_score(trader)
+
+    scored_traders.append({
+        "wallet": wallet,
+        "name": trader["name"],
+        "score": score
+    })
+
+
+scored_traders.sort(
+    key=lambda x: x["score"],
+    reverse=True
+)
+
+
+print()
+print("🏆 TOPP TRADERE")
+print("=" * 60)
+
+for i, trader in enumerate(
+    scored_traders[:20],
+    1
+):
+
+    print(
+        f"{i}. {trader['name']} | "
+        f"Score: ${trader['score']:,.0f}"
+    )
+
+
+# ============================================================
+# NEW TRADES
+# ============================================================
+
+print()
+print("=" * 60)
+print("🔎 SJEKKER NYE TRADES")
+print("=" * 60)
+
+new_trades = []
+
+for trader in scored_traders[:20]:
+
+    if trader["score"] <= 0:
+        continue
+
+    trades = get_trades(
+        trader["wallet"]
+    )
+
+    for trade in trades:
+
+        trade_id = create_trade_id(
+            trader["wallet"],
+            trade
+        )
+
+        if trade_exists(trade_id):
+            continue
+
+        condition_id = trade.get(
+            "conditionId"
+        )
+
+        cursor.execute("""
+            INSERT INTO trades (
+                trade_id,
+                trader,
+                wallet,
+                side,
+                outcome,
+                price,
+                size,
+                title,
+                timestamp,
+                first_seen,
+                condition_id,
+                asset
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            trade_id,
+            trader["name"],
+            trader["wallet"],
+            trade.get("side"),
+            trade.get("outcome"),
+            trade.get("price"),
+            trade.get("size"),
+            trade.get("title"),
+            trade.get("timestamp"),
+            datetime.now().isoformat(),
+            condition_id,
+            trade.get("asset")
+        ))
+
+        new_trades.append({
+            "trader": trader["name"],
+            "wallet": trader["wallet"],
+            "score": trader["score"],
+            "side": trade.get("side"),
+            "outcome": trade.get("outcome"),
+            "price": trade.get("price"),
+            "size": trade.get("size"),
+            "title": trade.get("title"),
+            "timestamp": trade.get("timestamp"),
+            "condition_id": condition_id,
+            "asset": trade.get("asset")
+        })
+
+
+conn.commit()
+
+
+# ============================================================
+# SIGNALS
+# ============================================================
+
+buy_signals = []
+sell_signals = []
+
+for trade in new_trades:
+
+    price = trade["price"] or 0
+    size = trade["size"] or 0
+
+    value = (
+        price * size
+    )
+
+    if value < MIN_TRADE_VALUE_USD:
+        continue
+
+    signal = {
+        **trade,
+        "value": value
+    }
+
+    if trade["side"] == "BUY":
+
+        buy_signals.append(signal)
+
+    elif trade["side"] == "SELL":
+
+        sell_signals.append(signal)
+
+
+buy_signals.sort(
+    key=lambda x: x["value"],
+    reverse=True
+)
+
+sell_signals.sort(
+    key=lambda x: x["value"],
+    reverse=True
+)
+
+
+# ============================================================
+# SELL SIGNALS
+# ============================================================
+
+print()
+print("=" * 60)
+print("🔴 NYE SELL-SIGNALER")
+print("=" * 60)
+
+if not sell_signals:
+
+    print()
+    print(
+        "Ingen nye sterke SELL-signaler."
+    )
+
+else:
+
+    for signal in sell_signals[:20]:
+
+        timestamp = signal["timestamp"]
+
+        if timestamp:
+
+            try:
+
+                time = datetime.fromtimestamp(
+                    timestamp
+                ).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+
+            except Exception:
+
+                time = "Ukjent"
+
+        else:
+
+            time = "Ukjent"
+
+        print()
+        print("🔴 SELL")
+        print("-" * 50)
+        print(
+            "Trader:",
+            signal["trader"]
+        )
+        print(
+            "Score:",
+            f"${signal['score']:,.0f}"
+        )
+        print(
+            "Handling:",
+            signal["side"]
+        )
+        print(
+            "Outcome:",
+            signal["outcome"]
+        )
+        print(
+            "Pris:",
+            signal["price"]
+        )
+        print(
+            "Posisjonsverdi:",
+            f"${signal['value']:,.2f}"
+        )
+        print(
+            "Marked:",
+            signal["title"]
+        )
+        print(
+            "Tid:",
+            time
+        )
+
+
+# ============================================================
+# BUY SIGNALS
+# ============================================================
+
+print()
+print("=" * 60)
+print("🚨 NYE BUY-SIGNALER")
+print("=" * 60)
+
+if not buy_signals:
+
+    print()
+    print(
+        "Ingen nye sterke BUY-signaler."
+    )
+
+else:
+
+    for signal in buy_signals[:20]:
+
+        timestamp = signal["timestamp"]
+
+        if timestamp:
+
+            try:
+
+                time = datetime.fromtimestamp(
+                    timestamp
+                ).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+
+            except Exception:
+
+                time = "Ukjent"
+
+        else:
+
+            time = "Ukjent"
+
+        print()
+        print("🔥 NYTT SIGNAL")
+        print("-" * 50)
+
+        print(
+            "Trader:",
+            signal["trader"]
+        )
+
+        print(
+            "Score:",
+            f"${signal['score']:,.0f}"
+        )
+
+        print(
+            "Handling:",
+            signal["side"]
+        )
+
+        print(
+            "Outcome:",
+            signal["outcome"]
+        )
+
+        print(
+            "Pris:",
+            signal["price"]
+        )
+
+        print(
+            "Posisjonsverdi:",
+            f"${signal['value']:,.2f}"
+        )
+
+        print(
+            "Marked:",
+            signal["title"]
+        )
+
+        print(
+            "Tid:",
+            time
+        )
+
+        paper_buy(
+            trader=signal["trader"],
+            outcome=signal["outcome"],
+            price=signal["price"],
+            title=signal["title"],
+            timestamp=signal["timestamp"],
+            condition_id=signal["condition_id"],
+            wallet=signal["wallet"],
+            asset=signal.get("asset")
+        )
+
+
+# ============================================================
+# FINAL ACCOUNT
+# ============================================================
+
+print()
+print("=" * 60)
+
+print(
+    f"📥 {len(new_trades)} "
+    "nye trades registrert."
+)
+
+print(
+    f"🟢 {len(buy_signals)} "
+    "nye BUY-signaler."
+)
+
+print(
+    f"🔴 {len(sell_signals)} "
+    "nye SELL-signaler."
+)
+
+print(
+    "📊 Bet-størrelse:",
+    "10 % av paper-kapitalen"
+)
+
+print("=" * 60)
+
+
+# Vis konto
+print()
+print("💰 PAPER-KONTO")
+print("=" * 60)
+
+cash = get_cash_balance()
+capital = get_total_paper_capital()
+
+print(
+    "Kontantsaldo:",
+    f"{cash:.2f} kr"
+)
+
+print(
+    "Paper-kapital:",
+    f"{capital:.2f} kr"
+)
+
+print(
+    "Neste maksbet:",
+    f"{get_bet_size():.2f} kr"
+)
+
+cursor.execute("""
+    SELECT
+        id,
+        trader,
+        outcome,
+        price,
+        shares,
+        invested,
+        title,
+        condition_id,
+        asset
+    FROM paper_positions
+    WHERE status = 'OPEN'
+""")
+
+positions = cursor.fetchall()
+
+print(
+    "Åpne posisjoner:",
+    len(positions)
+)
+
+print("-" * 60)
+
+total_invested = 0.0
+current_value_total = 0.0
+priced_positions = 0
+
+for position in positions:
+
+    (
+        position_id,
+        trader,
+        outcome,
+        entry_price,
+        shares,
+        invested,
+        title,
+        condition_id,
+        asset
+    ) = position
+
+    total_invested += invested
+
+    current_price = get_current_price(
+        condition_id,
+        outcome,
+        position_id,
+        title,
+        asset
+    )
+
+    print()
+    print("📊 POSISJON")
+    print("Marked:", title)
+    print("Outcome:", outcome)
+    print("Trader:", trader)
+    print(
+        "Kjøpspris:",
+        f"{entry_price:.4f}"
+    )
+    print(
+        "Investert:",
+        f"{invested:.2f} kr"
+    )
+
+    if current_price is not None:
+
+        value = (
+            shares * current_price
+        )
+
+        profit = (
+            value - invested
+        )
+
+        current_value_total += value
+        priced_positions += 1
+
+        print(
+            "Nåværende pris:",
+            f"{current_price:.4f}"
+        )
+
+        print(
+            "Nåverdi:",
+            f"{value:.2f} kr"
+        )
+
+        if profit >= 0:
+
+            print(
+                "Urealisert resultat:",
+                f"+{profit:.2f} kr"
+            )
+
+        else:
+
+            print(
+                "Urealisert resultat:",
+                f"{profit:.2f} kr"
+            )
+
+    else:
+
+        print(
+            "⚠️ Nåværende pris ikke tilgjengelig."
+        )
+
+
+print()
+print("-" * 60)
+
+print(
+    "Totalt investert:",
+    f"{total_invested:.2f} kr"
+)
+
+if priced_positions == len(positions):
+
+    total_equity = (
+        cash + current_value_total
+    )
+
+    total_profit = (
+        total_equity - PAPER_START_BALANCE
+    )
+
+    print(
+        "Total paper-verdi:",
+        f"{total_equity:.2f} kr"
+    )
+
+    if total_profit >= 0:
+
+        print(
+            "📈 Totalt paper-resultat:",
+            f"+{total_profit:.2f} kr"
+        )
+
+    else:
+
+        print(
+            "📉 Totalt paper-resultat:",
+            f"{total_profit:.2f} kr"
+        )
+
+else:
+
+    print(
+        f"⚠️ {len(positions) - priced_positions} "
+        "posisjon(er) mangler pris."
+    )
+
+    print(
+        "Total paper-verdi kan ikke beregnes "
+        "helt nøyaktig ennå."
+    )
+
+
+cursor.execute("""
+    SELECT
+        COUNT(*),
+        COALESCE(SUM(profit), 0)
+    FROM paper_positions
+    WHERE status = 'CLOSED'
+""")
+
+closed_count, closed_profit = cursor.fetchone()
+
+print()
+print(
+    "🔒 Lukkede posisjoner:",
+    closed_count
+)
+
+if closed_count > 0:
+
+    if closed_profit >= 0:
+
+        print(
+            "💵 Realisert resultat:",
+            f"+{closed_profit:.2f} kr"
+        )
+
+    else:
+
+        print(
+            "💵 Realisert resultat:",
+            f"{closed_profit:.2f} kr"
+        )
+
+print("=" * 60)
+
+
+conn.commit()
+conn.close()
+import requests
+import sqlite3
+import json
+from datetime import datetime
+
+DB = "trades.db"
+
+LEADERBOARD_URL = "https://data-api.polymarket.com/v1/leaderboard"
+TRADES_URL = "https://data-api.polymarket.com/trades"
+GAMMA_MARKET_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
+CLOB_MARKET_BY_TOKEN_URL = "https://clob.polymarket.com/markets-by-token"
+CLOB_MIDPOINT_URL = "https://clob.polymarket.com/midpoint"
+CLOB_PRICE_URL = "https://clob.polymarket.com/price"
+
+PAPER_START_BALANCE = 400.0
+PAPER_TRADE_SIZE_PERCENT = 0.10
+
+MIN_TRADE_VALUE_USD = 1000.0
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+conn = sqlite3.connect(DB, timeout=30)
+cursor = conn.cursor()
+
+cursor.execute("PRAGMA busy_timeout = 30000")
+cursor.execute("PRAGMA journal_mode = WAL")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS trades (
+    trade_id TEXT PRIMARY KEY,
+    trader TEXT,
+    wallet TEXT,
+    side TEXT,
+    outcome TEXT,
+    price REAL,
+    size REAL,
+    title TEXT,
+    timestamp INTEGER,
+    first_seen TEXT,
+    condition_id TEXT
+)
+""")
+
+try:
+    cursor.execute("ALTER TABLE trades ADD COLUMN condition_id TEXT")
+except sqlite3.OperationalError:
+    pass
+
+try:
+    cursor.execute("ALTER TABLE trades ADD COLUMN asset TEXT")
+except sqlite3.OperationalError:
+    pass
+
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS paper_account (
+    id INTEGER PRIMARY KEY,
+    balance REAL NOT NULL
+)
+""")
+
+cursor.execute("""
+INSERT OR IGNORE INTO paper_account (id, balance)
+VALUES (1, ?)
+""", (PAPER_START_BALANCE,))
+
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS paper_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trader TEXT,
+    outcome TEXT,
+    price REAL,
+    shares REAL,
+    invested REAL,
+    title TEXT,
+    timestamp INTEGER,
+    status TEXT,
+    condition_id TEXT,
+    sell_price REAL,
+    sell_value REAL,
+    profit REAL,
+    closed_timestamp INTEGER
+)
+""")
+
+for column, definition in [
+    ("condition_id", "TEXT"),
+    ("asset", "TEXT"),
+    ("wallet", "TEXT"),
+    ("sell_price", "REAL"),
+    ("sell_value", "REAL"),
+    ("profit", "REAL"),
+    ("closed_timestamp", "INTEGER"),
+]:
+    try:
+        cursor.execute(
+            f"ALTER TABLE paper_positions ADD COLUMN {column} {definition}"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+conn.commit()
+
+
+# ============================================================
+# HELPERS / MARKET LOOKUP
+# ============================================================
+
+def parse_json_array(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+    return None
+
+
+def normalize_text(value):
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().lower().split())
+
+
+def request_json(url, params=None, timeout=10):
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=timeout
+        )
+        if response.status_code != 200:
+            return None
+        return response.json()
+    except Exception:
+        return None
+
+
+def get_market_by_condition(condition_id, title=None):
+    """
+    Lookup order:
+    1. /markets via condition_ids
+    2. Official /public-search via q
+    """
+    if condition_id:
+        data = request_json(
+            GAMMA_MARKET_URL,
+            {"condition_ids": condition_id, "limit": 1}
+        )
+
+        if isinstance(data, list) and data:
+            return data[0]
+
+        if isinstance(data, dict) and data.get("markets"):
+            return data["markets"][0]
+
+    if not title:
+        return None
+
+    # IMPORTANT:
+    # /markets is a list endpoint, not the search endpoint.
+    # /public-search is specifically designed for this.
+    data = request_json(
+        GAMMA_SEARCH_URL,
+        {
+            "q": title,
+            "limit_per_type": 20,
+            "page": 1,
+            "keep_closed_markets": 1,
+            "search_profiles": "false",
+            "search_tags": "false"
+        }
+    )
+
+    if not isinstance(data, dict):
+        return None
+
+    wanted = normalize_text(title)
+    candidates = []
+
+    for event in data.get("events") or []:
+        candidates.extend(event.get("markets") or [])
+
+    # Exact question match first.
+    for market in candidates:
+        question = normalize_text(
+            market.get("question") or market.get("title")
+        )
+        if question == wanted:
+            return market
+
+    # Conservative fuzzy fallback.
+    words = {
+        w for w in wanted.replace(":", " ").split()
+        if len(w) >= 4
+    }
+
+    best = None
+    best_score = 0
+
+    for market in candidates:
+        question = normalize_text(
+            market.get("question") or market.get("title")
+        )
+        score = sum(1 for w in words if w in question)
+
+        if score > best_score:
+            best_score = score
+            best = market
+
+    if best is not None and best_score >= min(4, max(1, len(words))):
+        return best
+
+    return None
+
+
+def get_market_by_token(token_id):
+    if not token_id:
+        return None
+
+    return request_json(
+        f"{CLOB_MARKET_BY_TOKEN_URL}/{token_id}"
+    )
+
+
+def get_token_id_from_market(market, outcome):
+    if not market:
+        return None
+
+    outcomes = parse_json_array(market.get("outcomes"))
+    token_ids = parse_json_array(market.get("clobTokenIds"))
+
+    if not outcomes or not token_ids:
+        return None
+
+    wanted = normalize_text(outcome)
+
+    for i, market_outcome in enumerate(outcomes):
+        if normalize_text(market_outcome) == wanted:
+            if i < len(token_ids):
+                return str(token_ids[i])
+
+    return None
+
+
+def get_token_id(condition_id, outcome, title=None, asset=None):
+    # The trade's asset is the strongest identifier we have.
+    if asset:
+        return str(asset)
+
+    market = get_market_by_condition(condition_id, title)
+    return get_token_id_from_market(market, outcome)
+
+
+def get_settlement_price(
+    condition_id,
+    outcome,
+    title=None,
+    asset=None
+):
+    market = get_market_by_condition(condition_id, title)
+
+    if not market or not market.get("closed"):
+        return None
+
+    outcomes = parse_json_array(market.get("outcomes"))
+    prices = parse_json_array(market.get("outcomePrices"))
+
+    if not outcomes or not prices:
+        return None
+
+    wanted = normalize_text(outcome)
+
+    for i, market_outcome in enumerate(outcomes):
+        if normalize_text(market_outcome) == wanted:
+            if i >= len(prices):
+                return None
+            try:
+                price = float(prices[i])
+                if 0 <= price <= 1:
+                    return price
+            except Exception:
+                pass
+
+    return None
+
+
+def get_clob_price(token_id):
+    if not token_id:
+        return None
+
+    for url, params in [
+        (
+            CLOB_MIDPOINT_URL,
+            {"token_id": token_id}
+        ),
+        (
+            CLOB_PRICE_URL,
+            {"token_id": token_id, "side": "BUY"}
+        )
+    ]:
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=10
+            )
+
+            if response.status_code != 200:
+                continue
+
+            data = response.json()
+            value = (
+                data.get("mid")
+                if "mid" in data
+                else data.get("price")
+            )
+
+            if value is not None:
+                price = float(value)
+                if 0 <= price <= 1:
+                    return price
+
+        except Exception:
+            continue
+
+    return None
+
+
+def get_current_price(
+    condition_id,
+    outcome,
+    position_id=None,
+    title=None,
+    asset=None
+):
+    # First try the stored token/condition data.
+    if position_id:
+        repaired = repair_position_market_data(
+            position_id,
+            title,
+            outcome
+        )
+
+        if repaired:
+            condition_id = (
+                repaired.get("condition_id")
+                or condition_id
+            )
+            asset = (
+                repaired.get("asset")
+                or asset
+            )
+
+    settlement = get_settlement_price(
+        condition_id,
+        outcome,
+        title,
+        asset
+    )
+
+    if settlement is not None:
+        return settlement
+
+    token_id = get_token_id(
+        condition_id,
+        outcome,
+        title,
+        asset
+    )
+
+    return get_clob_price(token_id)
+
+
+# ============================================================
+# REPAIR OLD POSITIONS
+# ============================================================
+
+def find_asset_in_trader_history(
+    wallet,
+    title,
+    outcome,
+    timestamp=None
+):
+    if not wallet:
+        return None
+
+    trades = get_trades(wallet, limit=200)
+    wanted_title = normalize_text(title)
+    wanted_outcome = normalize_text(outcome)
+
+    candidates = []
+
+    for trade in trades:
+        if normalize_text(trade.get("title")) != wanted_title:
+            continue
+        if normalize_text(trade.get("outcome")) != wanted_outcome:
+            continue
+
+        asset = trade.get("asset")
+        if not asset:
+            continue
+
+        trade_ts = trade.get("timestamp")
+        distance = 0
+
+        try:
+            if timestamp and trade_ts:
+                distance = abs(int(trade_ts) - int(timestamp))
+        except Exception:
+            pass
+
+        candidates.append((distance, str(asset)))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
 def repair_position_market_data(
     position_id,
     title,
